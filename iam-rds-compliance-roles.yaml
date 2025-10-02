@@ -1,0 +1,185 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  IAM OIDC provider (optional) + Detection & Remediation roles for RDS compliance scripts run via GitHub Actions.
+  Creates two roles:
+    - dam-detection-role (read-only)
+    - dam-remediation-role (modify + optional log group creation)
+  Supports optional branch restriction for both roles.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub organization or user (OWNER in OWNER/REPO)
+  GitHubRepo:
+    Type: String
+    Description: Repository name (REPO in OWNER/REPO)
+  RestrictToBranch:
+    Type: String
+    Default: main
+    Description: Branch name to restrict Actions OIDC (leave blank to allow all refs)
+  DetectionRestrictToBranch:
+    Type: String
+    Default: ''
+    Description: Optional branch name to restrict detection role (blank keeps detection open to any ref)
+  IncludeOIDCProvider:
+    Type: String
+    AllowedValues: [true, false]
+    Default: false
+    Description: Set true to create GitHub OIDC provider (skip if it already exists)
+  AdditionalIAMPrincipals:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Optional extra IAM principals (users/roles) allowed to assume roles (for local testing)
+  EnableLogGroupCreation:
+    Type: String
+    AllowedValues: [true, false]
+    Default: true
+    Description: Allow remediation role to create/retention/tag CloudWatch log groups
+  PermissionBoundaryArn:
+    Type: String
+    Default: ''
+    Description: Optional permission boundary ARN
+
+Conditions:
+  CreateProvider: !Equals [!Ref IncludeOIDCProvider, true]
+  UseBranchRestriction: !Not [!Equals [!Ref RestrictToBranch, '']]
+  UseDetectionBranchRestriction: !Not [!Equals [!Ref DetectionRestrictToBranch, '']]
+  HasBoundary: !Not [!Equals [!Ref PermissionBoundaryArn, '']]
+  AllowLogGroupMgmt: !Equals [!Ref EnableLogGroupCreation, true]
+  HasAdditionalPrincipals: !Not [!Equals [!Join ['', !Ref AdditionalIAMPrincipals], '']]
+
+Resources:
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList: ['6938fd4d98bab03faadb97b34396831e3780aea1']
+
+  DetectionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: dam-detection-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RDSDescribe
+            Effect: Allow
+            Action:
+              - rds:Describe*
+              - rds:ListTagsForResource
+            Resource: '*'
+          - Sid: LogsDescribe
+            Effect: Allow
+            Action: [logs:DescribeLogGroups]
+            Resource: '*'
+          - Sid: CallerIdentity
+            Effect: Allow
+            Action: [sts:GetCallerIdentity]
+            Resource: '*'
+
+  RemediationPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: dam-remediation-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RDSDescribe
+            Effect: Allow
+            Action:
+              - rds:Describe*
+              - rds:ListTagsForResource
+            Resource: '*'
+          - Sid: RDSModify
+            Effect: Allow
+            Action:
+              - rds:ModifyDBInstance
+              - rds:ModifyDBCluster
+              - rds:ModifyDBParameterGroup
+              - rds:ModifyDBClusterParameterGroup
+            Resource: '*'
+          - Sid: LogsAccess
+            Effect: Allow
+            Action: !If [AllowLogGroupMgmt, [logs:DescribeLogGroups, logs:CreateLogGroup, logs:PutRetentionPolicy, logs:TagLogGroup], [logs:DescribeLogGroups]]
+            Resource: !If [AllowLogGroupMgmt, 'arn:aws:logs:*:*:log-group:/aws/rds/*', '*']
+          - Sid: CallerIdentity
+            Effect: Allow
+            Action: [sts:GetCallerIdentity]
+            Resource: '*'
+
+  DetectionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dam-detection-role
+      Description: GitHub Actions role for RDS compliance detection
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              # Detection role: optionally restrict to a specific branch if DetectionRestrictToBranch provided
+              StringLike: !If
+                - UseDetectionBranchRestriction
+                - { token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/${DetectionRestrictToBranch}' }
+                - { token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOwner}/${GitHubRepo}:*' }
+          - !If
+            - HasAdditionalPrincipals
+            - {
+                "Effect": "Allow",
+                "Principal": {"AWS": !Ref AdditionalIAMPrincipals},
+                "Action": "sts:AssumeRole"
+              }
+            - !Ref 'AWS::NoValue'
+      ManagedPolicyArns: [!Ref DetectionPolicy]
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionBoundaryArn, !Ref 'AWS::NoValue']
+
+  RemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dam-remediation-role
+      Description: GitHub Actions role for RDS compliance remediation
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike: !If
+                - UseBranchRestriction
+                - { token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/${RestrictToBranch}' }
+                - { token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOwner}/${GitHubRepo}:*' }
+          - !If
+            - HasAdditionalPrincipals
+            - {
+                "Effect": "Allow",
+                "Principal": {"AWS": !Ref AdditionalIAMPrincipals},
+                "Action": "sts:AssumeRole"
+              }
+            - !Ref 'AWS::NoValue'
+      ManagedPolicyArns: [!Ref RemediationPolicy]
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionBoundaryArn, !Ref 'AWS::NoValue']
+
+Outputs:
+  DetectionRoleArn:
+    Description: ARN of detection role
+    Value: !GetAtt DetectionRole.Arn
+  RemediationRoleArn:
+    Description: ARN of remediation role
+    Value: !GetAtt RemediationRole.Arn
+  ProviderCreated:
+    Description: Whether OIDC provider was created by this stack
+    Value: !If [CreateProvider, 'true', 'false']
+  BranchRestricted:
+    Description: Whether roles are restricted to a single branch
+    Value: !If [UseBranchRestriction, 'true', 'false']

@@ -1,0 +1,323 @@
+##########################################################################################################
+# RDS Compliance Monitoring Test Stack (Scripts-Only Version)
+#
+# Purpose
+# Minimal environment to exercise dam-detection.py and dam-remediation.py against intentionally
+# misconfigured RDS resources. No DynamoDB tables or Lambda functions are deployed—baseline comes
+# exclusively from baselines/rds-baseline.json in this repository.
+#
+# Deployed resources:
+# - S3 bucket for potential log export / manual reports (same naming convention for continuity)
+# - Public test VPC (2 subnets, IGW, route table) + permissive security group (DO NOT use in prod)
+# - Parameter groups (Aurora PostgreSQL cluster & instance, MySQL, SQL Server Express)
+# - Option Group for MySQL audit plugin (retained to simulate extra drift surface; scripts ignore it)
+# - Test RDS instances/clusters with DAMOnboarding tag on a subset to simulate onboarding
+#
+# Intentional drifts:
+# - MySQL: slow_query_log disabled (baseline expects enabled + other logging params)
+# - SQL Server: default language set to '0' (baseline may expect a different value if chosen)
+# - Aurora PostgreSQL: cluster & instance parameters set minimally (baseline will add logging/pgaudit)
+#
+# Cleanup: All RDS resources use DeletionPolicy=Delete and skip final snapshots for low-cost iteration.
+# Costs: RDS, S3, CloudWatch Logs – delete stack when finished.
+##########################################################################################################
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Minimal RDS compliance test stack for script-based baseline (no DynamoDB / no Lambda)
+
+Parameters:
+  DBUsername:
+    Description: Master username for test RDS instances
+    Type: String
+    Default: admin
+    NoEcho: true
+
+  DBPassword:
+    Description: Master password for test RDS instances
+    Type: String
+    NoEcho: true
+
+Resources:
+  ComplianceReportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub rds-compliance-report-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ##################
+  # Networking: VPC, Subnets, IGW, Route
+  ##################
+  PublicVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.100.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: PublicVPC
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PublicVPC
+      CidrBlock: 10.100.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnetA
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PublicVPC
+      CidrBlock: 10.100.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnetB
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref PublicVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref PublicVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  RdsPublicSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to RDS instances (test only, wide open)
+      VpcId: !Ref PublicVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: RdsPublicSG
+
+  TestPostgresSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Public subnet group for test RDS
+      SubnetIds:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      DBSubnetGroupName: test-postgres-subnet-group
+
+ 
+  ############################
+  # Test Parameter Groups
+  ############################
+  TestPostgresClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: test pg for aurora postgres cluster
+      Family: aurora-postgresql13
+      Parameters:
+        timezone: UTC
+
+  TestPostgresParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Test PG for Postgres
+      Family: aurora-postgresql13
+      Parameters:
+        log_statement: none
+
+  TestMySQLParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Test PG for MySQL
+      Family: mysql8.0
+      Parameters:
+        slow_query_log: '0'
+
+  TestMSSQLParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Test PG for MSSQL
+      Family: sqlserver-ex-15.0
+      Parameters:
+        default language: '0'
+
+  ############################
+  # Test RDS DB Instances
+  ############################
+  TestPostgresCluster1:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: '13.9'
+      DBClusterIdentifier: test-postgres-cluster-1
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBClusterParameterGroupName: !Ref TestPostgresClusterParameterGroup
+      DBSubnetGroupName: !Ref TestPostgresSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref RdsPublicSecurityGroup
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 4
+      EnableCloudwatchLogsExports:
+        - postgresql
+
+  TestPostgresCluster2:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: '13.9'
+      DBClusterIdentifier: test-postgres-cluster-2
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBClusterParameterGroupName: !Ref TestPostgresClusterParameterGroup
+      DBSubnetGroupName: !Ref TestPostgresSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref RdsPublicSecurityGroup
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 4
+      EnableCloudwatchLogsExports:
+        - postgresql
+      Tags:
+        - Key: DAMOnboarding
+          Value: true
+
+  TestPostgresDB1:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: test-postgres-db-1
+      DBClusterIdentifier: !Ref TestPostgresCluster1
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      DBParameterGroupName: !Ref TestPostgresParameterGroup
+      PubliclyAccessible: true
+      
+  TestPostgresDB2:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: test-postgres-db-2
+      DBClusterIdentifier: !Ref TestPostgresCluster2
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      DBParameterGroupName: !Ref TestPostgresParameterGroup
+      PubliclyAccessible: true
+      Tags:
+        - Key: DAMOnboarding
+          Value: true
+
+  MySQLAuditOptionGroup:
+    Type: AWS::RDS::OptionGroup
+    Properties:
+      EngineName: mysql
+      MajorEngineVersion: '8.0'
+      OptionGroupDescription: Enable MariaDB Audit Plugin for MySQL
+      OptionConfigurations:
+        - OptionName: MARIADB_AUDIT_PLUGIN
+
+  TestMySQLDB:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DeletionProtection: false
+      DeleteAutomatedBackups: true
+      DBInstanceIdentifier: test-mysql-db
+      Engine: mysql
+      EngineVersion: '8.0'
+      DBInstanceClass: db.t3.medium
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBParameterGroupName: !Ref TestMySQLParameterGroup
+      OptionGroupName: !Ref MySQLAuditOptionGroup
+      DBSubnetGroupName: !Ref TestPostgresSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsPublicSecurityGroup
+      AllocatedStorage: 20
+      PubliclyAccessible: true
+      EnableCloudwatchLogsExports:
+        - error
+        - general
+        #- slowquery
+      Tags:
+        - Key: DAMOnboarding
+          Value: true
+      
+  TestMSSQLDB:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DeletionProtection: false
+      DeleteAutomatedBackups: true
+      DBInstanceIdentifier: test-mssql-db
+      Engine: sqlserver-ex
+      EngineVersion: 15.00.4073.23.v1
+      DBInstanceClass: db.t3.medium
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBParameterGroupName: !Ref TestMSSQLParameterGroup
+      DBSubnetGroupName: !Ref TestPostgresSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsPublicSecurityGroup
+      AllocatedStorage: 20
+      PubliclyAccessible: true
+      Tags:
+        - Key: DAMOnboarding
+          Value: true
+      
+
+
+Outputs:
+  TestPostgresDB1:
+    Value: !Ref TestPostgresDB1
+  TestPostgresDB2:
+    Value: !Ref TestPostgresDB2
+  TestMySQLDB:
+    Value: !Ref TestMySQLDB
+  TestMSSQLDB:
+    Value: !Ref TestMSSQLDB
