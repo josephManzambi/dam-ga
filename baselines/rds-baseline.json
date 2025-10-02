@@ -1,0 +1,55 @@
+{
+	"engines": {
+		"rds/mysql": {
+			"parameters": {
+				"slow_query_log": "1",
+				"long_query_time": "2",
+				"log_output": "FILE",
+				"general_log": "1"
+			},
+			"exports": ["error", "general", "slowquery"]
+		},
+		"rds/aurora-postgresql": {
+			"clusterParameters": {
+				"pgaudit.role": "rds_pgaudit",
+				"shared_preload_libraries": "pgaudit",
+				"pgaudit.log": "all",
+				"log_connections": "1",
+				"log_disconnections": "1",
+				"log_error_verbosity": "default"
+			},
+			"exports": ["postgresql"]
+		},
+		"rds/sqlserver-ex": {
+			"parameters": {
+				"default language": "0"
+			},
+			"exports": ["error"]
+		},
+		"rds/sqlserver-web": {
+			"parameters": {
+				"default language": "0"
+			},
+			"exports": ["error"]
+		},
+		"rds/sqlserver-se": {
+			"parameters": {
+				"default language": "0"
+			},
+			"exports": ["error"]
+		},
+		"rds/sqlserver-ee": {
+			"parameters": {
+				"default language": "0"
+			},
+			"exports": ["error"]
+		}
+	},
+	"selection": {
+		"tagKey": "DAMOnboarding",
+		"tagValue": "true"
+	},
+	"rules": {
+		"skipDefaultParameterGroups": true
+	}
+}
