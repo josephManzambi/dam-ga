@@ -23,25 +23,27 @@ jobs:
     outputs:
       matrix: ${{ steps.build.outputs.matrix }}
     steps:
-      - name: Build dynamic matrix
+      - name: Build matrix include list
         id: build
         shell: bash
         run: |
           set -e
-          regions='${{ inputs.regions }}'
-          accounts='${{ inputs.accounts }}'
-          regions_json=$(echo "$regions" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R -s -c 'split("\n")|map(select(length>0))')
-          accounts_json=$(echo "$accounts" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R -s -c 'split("\n")|map(select(length>0))')
-          # Build cartesian product and ensure compact single-line JSON to satisfy GitHub output formatting
-          matrix=$(jq -c -n --argjson regions "$regions_json" --argjson roles "$accounts_json" '{include: [ $regions[] as $r | $roles[] as $role | {region:$r, role:$role} ] }')
-          echo "Matrix (compact): $matrix"
+          regions_raw='${{ inputs.regions }}'
+          roles_raw='${{ inputs.accounts }}'
+          regions_json=$(echo "$regions_raw" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R -s -c 'split("\n")|map(select(length>0))')
+          roles_json=$(echo "$roles_raw" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R -s -c 'split("\n")|map(select(length>0))')
+          if [ "$(echo $regions_json | jq 'length')" -eq 0 ]; then echo '::error ::No regions provided'; exit 1; fi
+          if [ "$(echo $roles_json | jq 'length')" -eq 0 ]; then echo '::error ::No roles provided'; exit 1; fi
+          matrix=$(jq -c -n --argjson regions "$regions_json" --argjson roles "$roles_json" '{include:[ $regions[] as $r | $roles[] as $role | {region:$r, role:$role} ]}')
+          echo "Matrix include: $matrix"
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
   detect:
     runs-on: ubuntu-latest
     needs: prepare-matrix
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix).include }}
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,9 +53,9 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Configure AWS credentials (assume detection role)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
-            matrix=$(jq -c -n --argjson regions "$regions_json" --argjson roles "$accounts_json" '{region:$regions, role:$roles}')
+        with:
           role-to-assume: ${{ matrix.role }}
           aws-region: ${{ matrix.region }}
       - name: Show caller identity
@@ -61,10 +63,10 @@ jobs:
       - name: Run detection
         shell: bash
         run: |
-        matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+          set -e
           mkdir -p reports
           acct=$(echo "${{ matrix.role }}" | awk -F: '{print $5}')
-          echo "--- Detection for account $acct role ${{ matrix.role }} region ${{ matrix.region }} ---"
+          echo "--- Detection for account $acct region ${{ matrix.region }} role ${{ matrix.role }} ---"
           python ./dam-detection.py \
             --baseline baselines/rds-baseline.json \
             --region "${{ matrix.region }}" \
