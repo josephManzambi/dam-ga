@@ -10,6 +10,14 @@ on:
       accounts:
         description: "Comma-separated detection role ARNs (one per account)"
         required: true
+      fail_on_drift:
+        description: "Fail the workflow when drift is detected (true/false)"
+        required: false
+        default: "true"
+      fail_min_severity:
+        description: "Minimum severity that triggers failure (low|medium|high)"
+        required: false
+        default: "low"
   schedule:
     - cron: "0 3 * * *"  # daily 03:00 UTC
 
@@ -146,7 +154,42 @@ jobs:
           if [ ! -f combined/aggregate-summary.json ]; then echo "had_drift=false" >> $GITHUB_OUTPUT; exit 0; fi
           had=$(jq -r '.hadDrift // false' combined/aggregate-summary.json)
           echo "had_drift=$had" >> $GITHUB_OUTPUT
-          if [ "$had" = "true" ]; then
-            echo '::error ::Drift detected. Failing pipeline.'
+          fail_on='${{ inputs.fail_on_drift }}'
+          min_sev='${{ inputs.fail_min_severity }}'
+          if [ "$had" != "true" ]; then
+            echo '::notice ::No drift detected.'
+            exit 0
+          fi
+          # If not failing on drift, just warn
+          if [ "$fail_on" != "true" ]; then
+            echo '::warning ::Drift detected but fail_on_drift=false so workflow will succeed.'
+            exit 0
+          fi
+          # Severity-based gating
+          sev_json=$(jq -r '.aggregatedSeverity' combined/aggregate-summary.json)
+          high=$(echo "$sev_json" | jq -r '.high // 0')
+          medium=$(echo "$sev_json" | jq -r '.medium // 0')
+          low=$(echo "$sev_json" | jq -r '.low // 0')
+          trigger=0
+          case "$min_sev" in
+            high)
+              [ "$high" -gt 0 ] && trigger=1 || trigger=0
+              ;;
+            medium)
+              tot=$((high + medium))
+              [ "$tot" -gt 0 ] && trigger=1 || trigger=0
+              ;;
+            low)
+              # any drift triggers (already know had=true)
+              trigger=1
+              ;;
+            *)
+              trigger=1
+              ;;
+          esac
+          if [ "$trigger" -eq 1 ]; then
+            echo "::error ::Drift detected (severity threshold: $min_sev). High=$high Medium=$medium Low=$low"
             exit 1
+          else
+            echo "::warning ::Drift detected but below failure severity threshold ($min_sev). High=$high Medium=$medium Low=$low"
           fi
