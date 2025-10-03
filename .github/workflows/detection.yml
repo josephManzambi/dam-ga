@@ -67,10 +67,13 @@ jobs:
           mkdir -p reports
           acct=$(echo "${{ matrix.role }}" | awk -F: '{print $5}')
           echo "--- Detection for account $acct region ${{ matrix.region }} role ${{ matrix.role }} ---"
+          echo "Showing dam-detection.py help (to verify argument requirements):"
+          python ./dam-detection.py --help || true
           python ./dam-detection.py \
             --baseline baselines/rds-baseline.json \
             --region "${{ matrix.region }}" \
             --use-current-credentials \
+            --account-role-arn "${{ matrix.role }}" \
             --check-log-groups \
             --output "reports/detect-${acct}-${{ matrix.region }}.json" || echo "WARNING: detection script non-zero (allowed)"
           ls -l reports || true
