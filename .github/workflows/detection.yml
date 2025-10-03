@@ -53,7 +53,7 @@ jobs:
         run: pip install -r requirements.txt
       - name: Configure AWS credentials (assume detection role)
         uses: aws-actions/configure-aws-credentials@v4
-        with:
+            matrix=$(jq -c -n --argjson regions "$regions_json" --argjson roles "$accounts_json" '{region:$regions, role:$roles}')
           role-to-assume: ${{ matrix.role }}
           aws-region: ${{ matrix.region }}
       - name: Show caller identity
@@ -61,7 +61,7 @@ jobs:
       - name: Run detection
         shell: bash
         run: |
-          set -e
+        matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
           mkdir -p reports
           acct=$(echo "${{ matrix.role }}" | awk -F: '{print $5}')
           echo "--- Detection for account $acct role ${{ matrix.role }} region ${{ matrix.region }} ---"
