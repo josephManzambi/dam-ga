@@ -18,15 +18,12 @@ Repository structure (active)
 - test-rds-dam-stack.yaml: optional scripts-only test infrastructure (no Lambda, no DynamoDB).
 - README.md: this file.
 
-Deprecated / legacy (present or previously removed)
-- test-rds-scripts-stack.yaml (deprecated; superseded by test-rds-dam-stack.yaml you elected to keep)
-- dam-cross-account-roles.yaml (legacy duplicate; not used—safe to delete)
-If still in your clone, delete deprecated templates to avoid confusion.
 
-Baseline JSON
+Baseline JSON (schemaVersion 1 with severity)
 - Managed as code; one file can cover multiple engines. Current example (mirrors the default `baselines/rds-baseline.json` in this repo):
 ```json
 {
+  "schemaVersion": 1,
   "engines": {
     "rds/mysql": {
       "parameters": {
@@ -35,57 +32,40 @@ Baseline JSON
         "log_output": "FILE",
         "general_log": "1"
       },
-      "exports": ["error", "general", "slowquery"]
+      "exports": ["error", "general", "slowquery"],
+      "severity": {
+        "parameters": {"slow_query_log": "high", "general_log": "medium", "long_query_time": "low", "log_output": "low"},
+        "exports": {"error": "high", "general": "medium", "slowquery": "low"}
+      }
     },
     "rds/aurora-postgresql": {
       "clusterParameters": {
         "pgaudit.role": "rds_pgaudit",
-        "shared_preload_libraries": "pgaudit",
+        "shared_preload_libraries": "pg_stat_statements,pgaudit",
         "pgaudit.log": "all",
         "log_connections": "1",
         "log_disconnections": "1",
         "log_error_verbosity": "default"
       },
-      "exports": ["postgresql"]
+      "exports": ["postgresql"],
+      "severity": {
+        "clusterParameters": {"pgaudit.role": "high", "shared_preload_libraries": "high", "pgaudit.log": "high", "log_connections": "medium", "log_disconnections": "medium", "log_error_verbosity": "low"},
+        "exports": {"postgresql": "high"}
+      }
     },
-    "rds/sqlserver-ex": {
-      "parameters": {
-        "default language": "0"
-      },
-      "exports": ["error"]
-    },
-    "rds/sqlserver-web": {
-      "parameters": {
-        "default language": "0"
-      },
-      "exports": ["error"]
-    },
-    "rds/sqlserver-se": {
-      "parameters": {
-        "default language": "0"
-      },
-      "exports": ["error"]
-    },
-    "rds/sqlserver-ee": {
-      "parameters": {
-        "default language": "0"
-      },
-      "exports": ["error"]
-    }
+    "rds/sqlserver-ex": {"parameters": {"default language": "0"}, "exports": ["error"], "severity": {"parameters": {"default language": "low"}, "exports": {"error": "high"}}},
+    "rds/sqlserver-web": {"parameters": {"default language": "0"}, "exports": ["error"], "severity": {"parameters": {"default language": "low"}, "exports": {"error": "high"}}},
+    "rds/sqlserver-se": {"parameters": {"default language": "0"}, "exports": ["error"], "severity": {"parameters": {"default language": "low"}, "exports": {"error": "high"}}},
+    "rds/sqlserver-ee": {"parameters": {"default language": "0"}, "exports": ["error"], "severity": {"parameters": {"default language": "low"}, "exports": {"error": "high"}}}
   },
-  "selection": {
-    "tagKey": "DAMOnboarding",
-    "tagValue": "true"
-  },
-  "rules": {
-    "skipDefaultParameterGroups": true
-  }
+  "selection": {"tagKey": "DAMOnboarding", "tagValue": "true"},
+  "rules": {"skipDefaultParameterGroups": true}
 }
 ```
 Notes:
 - engines keys are rds/<engine> (e.g., rds/mysql, rds/aurora-postgresql, rds/sqlserver-ex|web|se|ee).
 - MySQL baseline enables both slow query and general logs, and forces `log_output=FILE` so CloudWatch exports function (TABLE writes to internal tables only).
-- For Aurora PostgreSQL, parameters live under `clusterParameters`. If existing clusters already set other libraries (e.g. `pg_stat_statements`), append rather than overwrite `shared_preload_libraries`.
+- For Aurora PostgreSQL, parameters live under `clusterParameters`. `shared_preload_libraries` is treated as additive: baseline list must be a subset of the current list.
 - `pgaudit.role` is declared so you can create that role separately (scripts do not create database roles).
 - SQL Server Web/Standard/Enterprise appear in the baseline for forward use (future expansion) even though the current test stack provisions only the Express edition. This forward-looking inclusion avoids baseline churn later; removal is optional if you want a strictly minimal baseline.
 - Unsupported or edition-specific parameters (audit / compression) were intentionally removed after region/edition validation in eu-west-1.
@@ -106,8 +86,9 @@ dam-detection.py
   - --account-role-arn: IAM role ARN to assume in the target account (OIDC).
   - --output: output JSON report path (default detect-report.json).
 - Output:
-  - JSON report listing deviations per instance/cluster.
-  - Exit code 2 if deviations exist (useful for CI signals), 0 otherwise.
+  - Full JSON report (instances/clusters with deviations) plus per-object deviation severity.
+  - Summary JSON (counts: paramDrifts, exportDrifts, logGroupDrifts, severityTotals, objectsWithDrift, hasDrift).
+  - Exit code 2 if deviations exist (CI will treat as failure unless overridden in workflow logic).
 
 Example (Windows PowerShell)
 ```powershell
@@ -123,6 +104,7 @@ dam-remediation.py
 - What it does:
   - For instance deviations: ModifyDBParameterGroup (batched), ModifyDBInstance to enable missing exports (with retries if config in progress).
   - For cluster deviations (Aurora PG): ModifyDBClusterParameterGroup, ModifyDBCluster to enable missing cluster exports (with retries).
+  - Honors a minimum severity threshold (`--min-severity`) so you can phase remediation (e.g., remediate only high first).
 - Does NOT:
   - Create or delete infrastructure (no log group creation, no option groups).
   - Reboot instances/clusters automatically (RDS may set pending-reboot for static parameter changes).
@@ -131,6 +113,7 @@ dam-remediation.py
   - --report: path to a detection report (output of dam-detection.py).
   - --region, --account-role-arn: same as detection.
   - --apply: actually apply changes. Without this flag, it’s a dry-run.
+  - --min-severity: low|medium|high (default low – apply all). Set to high for incremental rollout.
 - Output:
   - Console logs indicating intended/applied changes.
 
@@ -156,8 +139,8 @@ GitHub Actions (optional)
 
 Detection workflow (scheduled + manual)
 - Uses OIDC to assume per-account roles supplied as input.
-- Produces JSON reports as artifacts.
-- Non-destructive and safe to run daily.
+- Produces per-account full reports and summaries; aggregate job combines into `all-detect.json`, `all-summaries.json`, and `aggregate-summary.json` with consolidated severity counts.
+- Pipeline fails automatically on drift (can be extended later with an allow-drift toggle).
 Key points:
 - permissions: id-token: write to enable OIDC.
 - Parse a comma-separated list of role ARNs; iterate per region.
