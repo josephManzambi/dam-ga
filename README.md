@@ -9,14 +9,13 @@ Overview
     - dam-remediation.py: optional remediation (applies changes).
   - GitHub Actions workflows (optional) to run detection on schedule and remediation on demand via OIDC and AssumeRole.
 
-Repository structure (active)
-- baselines/
-  - rds-baseline.json: single source of truth per engine (parameters + CloudWatch exports).
-- dam-detection.py / dam-remediation.py: top-level scripts (no DynamoDB dependency).
-- iam-rds-compliance-roles.yaml: unified OIDC roles template.
-- dam-detection-ga.yml / dam-remediation-ga.yml: GitHub Actions workflows (optional automation).
-- test-rds-dam-stack.yaml: optional scripts-only test infrastructure (no Lambda, no DynamoDB).
-- README.md: this file.
+Repository structure
+- baselines/rds-baseline.json – baseline parameters & exports with severity.
+- dam-detection.py / dam-remediation.py – detection & remediation scripts.
+- iam-rds-compliance-roles.yaml – OIDC detection & remediation roles.
+- .github/workflows/detection.yml / remediation.yml – automation.
+- test-rds-dam-stack.yaml – optional test stack (scripts only).
+- README.md – this document.
 
 
 Baseline JSON (schemaVersion 1 with severity)
@@ -62,15 +61,14 @@ Baseline JSON (schemaVersion 1 with severity)
   "rules": {"skipDefaultParameterGroups": true}
 }
 ```
-Notes:
-- engines keys are rds/<engine> (e.g., rds/mysql, rds/aurora-postgresql, rds/sqlserver-ex|web|se|ee).
-- MySQL baseline enables both slow query and general logs, and forces `log_output=FILE` so CloudWatch exports function (TABLE writes to internal tables only).
-- For Aurora PostgreSQL, parameters live under `clusterParameters`. `shared_preload_libraries` is treated as additive: baseline list must be a subset of the current list.
-- `pgaudit.role` is declared so you can create that role separately (scripts do not create database roles).
-- SQL Server Web/Standard/Enterprise appear in the baseline for forward use (future expansion) even though the current test stack provisions only the Express edition. This forward-looking inclusion avoids baseline churn later; removal is optional if you want a strictly minimal baseline.
-- Unsupported or edition-specific parameters (audit / compression) were intentionally removed after region/edition validation in eu-west-1.
-- `selection` restricts processing to tagged DBs. Remove the section (or set tagKey empty) to scan all instances/clusters.
-- `skipDefaultParameterGroups=true` avoids futile modifications against immutable AWS default.* groups.
+Key points:
+- Engine keys use prefix `rds/<engine>` (mysql, aurora-postgresql, sqlserver-* variants).
+- MySQL baseline enables slow/general query logging with `log_output=FILE`.
+- Aurora `shared_preload_libraries` is additive (baseline subset required).
+- `pgaudit.role` must pre-exist in each Aurora Postgres cluster.
+- SQL Server editions beyond Express are included for forward enforcement readiness.
+- `selection` tag filter narrows scope; remove it to scan all RDS assets.
+- `skipDefaultParameterGroups=true` skips immutable AWS defaults.
 
 ## Severity Model
 
@@ -204,12 +202,18 @@ python .\scripts\dam-remediation.py `
   --apply
 ```
 
-GitHub Actions (optional)
+GitHub Actions
 
 Detection workflow (scheduled + manual)
 - Uses OIDC to assume per-account roles supplied as input.
 - Produces per-account full reports and summaries; aggregate job combines into `all-detect.json`, `all-summaries.json`, and `aggregate-summary.json` with consolidated severity counts.
-- Pipeline fails automatically on drift (can be extended later with an allow-drift toggle).
+- Drift gating is configurable via dispatch inputs:
+  - `fail_on_drift` (true|false, default true) – whether drift can fail the run.
+  - `fail_min_severity` (low|medium|high, default low) – minimum severity that triggers failure when `fail_on_drift=true`.
+    - Observation mode: fail_on_drift=false
+    - Phased enforcement: fail_on_drift=true + fail_min_severity=high (start) then medium
+    - Full enforcement: fail_on_drift=true + fail_min_severity=low
+  - Scheduled runs can optionally be adjusted later to soft-fail automatically if desired.
 Key points:
 - permissions: id-token: write to enable OIDC.
 - Parse a comma-separated list of role ARNs; iterate per region.
@@ -239,21 +243,13 @@ Troubleshooting
 - Default parameter groups:
   - If your environments use default.* groups but you still want to enforce values, set rules.skipDefaultParameterGroups = false (note: many defaults are immutable).
 
-Migration summary (legacy -> current)
-- Baseline source: DynamoDB tables (ReferenceParameterGroups) -> single JSON (baselines/rds-baseline.json).
-- Execution model: Account Lambda + DynamoDB + S3 report -> Stateless scripts run locally or via GitHub Actions OIDC roles.
-- Discovery scope: Tag-driven (DAMOnboarding) remained, now configured in baseline `selection`.
-- Reporting: S3 object per run -> local/CI artifact (JSON report); easier diffing in PRs.
-- Infrastructure side-effects: Legacy Lambda created log groups & removed tags; new scripts avoid infra creation (optional log group creation only if future enhancement added) and leave tags intact.
-- Reduced moving parts: No Lambda packaging, no DynamoDB seed data, faster iteration.
-
 License and contributions
-- Add a LICENSE file (e.g., MIT).
-- PRs/issues welcome. Do not include secrets or account IDs in
+- (Add a LICENSE file if distributing publicly.)
+- PRs/issues welcome. Do not include secrets or account IDs in examples.
  
 ## IAM Roles (GitHub Actions OIDC)
 
-Use the single template `iam-rds-compliance-roles.yaml` for deploying the detection and remediation roles. The older simplified template has been removed to avoid duplication.
+Use the `iam-rds-compliance-roles.yaml` template to deploy detection and remediation roles.
 
 Key parameters:
 - GitHubOwner / GitHubRepo: OWNER/REPO that will run the workflows.
@@ -283,16 +279,11 @@ After deployment, reference the exported role ARNs (or describe the stack) in yo
 
 ## Test Infrastructure (Optional)
 
-You chose to retain `test-rds-dam-stack.yaml` as the single scripts-only test harness.
-
-What it creates:
-- S3 bucket (report/log continuity naming) – optional for scripts but harmless.
-- Public VPC, two public subnets, open security group (0.0.0.0/0 – test only; never use in prod).
-- Aurora PostgreSQL (2 clusters + 2 instances): only the second cluster/instance pair is tagged `DAMOnboarding=true` to demonstrate tag scoping; both have minimal parameter settings so baseline will detect cluster parameter drift.
-- MySQL instance with logging disabled/misaligned (slow_query_log=0, missing general/slowquery exports) – demonstrates parameter + export remediation.
-- SQL Server Express instance with only export drift (and optionally parameter drift if you change `default language`).
-
-Forward-use baseline entries: SQL Server Web / Standard / Enterprise families are present in the baseline even though the test stack does not create those editions yet. This is intentional future-proofing—allowing you to begin enforcing those settings in production accounts without having to rewrite the baseline schema later.
+`test-rds-dam-stack.yaml` (optional) creates:
+- Public VPC, two public subnets, a permissive security group (test only!)
+- Aurora PostgreSQL: two clusters (only one tagged for onboarding) + instances
+- MySQL instance with intentional logging drift
+- SQL Server Express instance with drift surfaces
 
 Deployment (PowerShell example):
 ```powershell
@@ -310,7 +301,5 @@ aws cloudformation delete-stack --stack-name rds-compliance-test --region eu-wes
 aws cloudformation wait stack-delete-complete --stack-name rds-compliance-test --region eu-west-1
 ```
 
-Deprecated template `test-rds-scripts-stack.yaml` (parameterized variant) was superseded and is safe to delete—its functionality is subsumed by the retained stack and forward-looking baseline entries.
-
-Note: A MySQL audit Option Group existed in earlier iterations; since the scripts do not manage Option Groups today, it was kept only when needed for drift demonstration. If absent, remediation remains unaffected.
+Optional: extend the stack with additional engines or remove unneeded ones to minimize cost footprint.
 
