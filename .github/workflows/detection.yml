@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.build.outputs.matrix }}
+      allow-drift: ${{ steps.build.outputs.allow_drift }}
     steps:
       - name: Build matrix include list
         id: build
@@ -37,6 +38,7 @@ jobs:
           matrix=$(jq -c -n --argjson regions "$regions_json" --argjson roles "$roles_json" '{include:[ $regions[] as $r | $roles[] as $role | {region:$r, role:$role} ]}')
           echo "Matrix include: $matrix"
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
+          echo "allow_drift=false" >> $GITHUB_OUTPUT
 
   detect:
     runs-on: ubuntu-latest
@@ -75,7 +77,8 @@ jobs:
             --use-current-credentials \
             --account-role-arn "${{ matrix.role }}" \
             --check-log-groups \
-            --output "reports/detect-${acct}-${{ matrix.region }}.json" || echo "WARNING: detection script non-zero (allowed)"
+            --output "reports/detect-${acct}-${{ matrix.region }}.json" \
+            --summary-output "reports/detect-summary-${acct}-${{ matrix.region }}.json" || echo "WARNING: detection script non-zero (allowed)"
           ls -l reports || true
       - name: Upload per-account report
         if: always()
@@ -87,6 +90,8 @@ jobs:
   aggregate:
     runs-on: ubuntu-latest
     needs: detect
+    outputs:
+      had-drift: ${{ steps.evaluate.outputs.had_drift }}
     steps:
       - name: Download all per-account artifacts
         uses: actions/download-artifact@v4
@@ -100,15 +105,32 @@ jobs:
           if [ ! -d all-reports ]; then
             echo '::warning ::Artifact directory all-reports not found (no per-account artifacts downloaded).'
             echo '[]' > combined/all-detect.json
+            echo '[]' > combined/all-summaries.json
             ls -1 combined
             exit 0
           fi
-          found=$(find all-reports -type f -name 'detect-*.json' 2>/dev/null | wc -l | tr -d ' ')
+          found=$(find all-reports -type f -name 'detect-*.json' ! -name '*summary*' 2>/dev/null | wc -l | tr -d ' ')
           if [ "$found" = "0" ]; then
             echo '::warning ::No detection reports found to aggregate.'
             echo '[]' > combined/all-detect.json
           else
-            jq -s '.' $(find all-reports -type f -name 'detect-*.json' -print) > combined/all-detect.json || echo '[]' > combined/all-detect.json
+            jq -s '.' $(find all-reports -type f -name 'detect-*.json' ! -name '*summary*' -print) > combined/all-detect.json || echo '[]' > combined/all-detect.json
+          fi
+          # Summaries aggregation
+          sum_found=$(find all-reports -type f -name 'detect-summary-*.json' 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$sum_found" = "0" ]; then
+            echo '::warning ::No summary reports.'
+            echo '[]' > combined/all-summaries.json
+          else
+            jq -s '.' $(find all-reports -type f -name 'detect-summary-*.json' -print) > combined/all-summaries.json || echo '[]' > combined/all-summaries.json
+          fi
+          if [ -s combined/all-summaries.json ]; then
+            had_drift=$(jq '[ .[] | select(.hasDrift==true) ] | length > 0' combined/all-summaries.json)
+            sev=$(jq -r '[ .[] | .severityTotals ] | reduce .[] as $o ({}; reduce ($o|to_entries[]) as $kv (. ; .[$kv.key] = (.[$kv.key]//0) + $kv.value ))' combined/all-summaries.json)
+            totalObjects=$(jq '[ .[] | .objectsWithDrift ] | add // 0' combined/all-summaries.json)
+            jq -n --argjson had "$had_drift" --argjson sev "$sev" --arg totalObjects "$totalObjects" '{hadDrift:$had, aggregatedSeverity:$sev, objectsWithDrift:($totalObjects|tonumber)}' > combined/aggregate-summary.json
+          else
+            echo '{}' > combined/aggregate-summary.json
           fi
           ls -1 combined
       - name: Upload aggregated reports
@@ -116,3 +138,15 @@ jobs:
         with:
           name: detect-reports
           path: combined/
+      - name: Evaluate drift and fail if present
+        id: evaluate
+        shell: bash
+        run: |
+          set -e
+          if [ ! -f combined/aggregate-summary.json ]; then echo "had_drift=false" >> $GITHUB_OUTPUT; exit 0; fi
+          had=$(jq -r '.hadDrift // false' combined/aggregate-summary.json)
+          echo "had_drift=$had" >> $GITHUB_OUTPUT
+          if [ "$had" = "true" ]; then
+            echo '::error ::Drift detected. Failing pipeline.'
+            exit 1
+          fi
