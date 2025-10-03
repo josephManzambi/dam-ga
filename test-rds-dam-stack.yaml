@@ -7,7 +7,7 @@
 # exclusively from baselines/rds-baseline.json in this repository.
 #
 # Deployed resources:
-# - S3 bucket for potential log export / manual reports (same naming convention for continuity)
+# (Removed S3 bucket for report storage – artifacts handled by GitHub Actions now)
 # - Public test VPC (2 subnets, IGW, route table) + permissive security group (DO NOT use in prod)
 # - Parameter groups (Aurora PostgreSQL cluster & instance, MySQL, SQL Server Express)
 # - Option Group for MySQL audit plugin (retained to simulate extra drift surface; scripts ignore it)
@@ -39,15 +39,7 @@ Parameters:
     NoEcho: true
 
 Resources:
-  ComplianceReportBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub rds-compliance-report-${AWS::AccountId}-${AWS::Region}
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
+  # (ComplianceReportBucket removed – no longer required)
 
   ##################
   # Networking: VPC, Subnets, IGW, Route
