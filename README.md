@@ -72,6 +72,75 @@ Notes:
 - `selection` restricts processing to tagged DBs. Remove the section (or set tagKey empty) to scan all instances/clusters.
 - `skipDefaultParameterGroups=true` avoids futile modifications against immutable AWS default.* groups.
 
+## Severity Model
+
+The baseline now includes a `severity` map per engine (separately for `parameters`, `clusterParameters`, and `exports`). These drive:
+- Detection report annotation (each deviation includes `severity`).
+- Aggregated severity totals in `aggregate-summary.json`.
+- Gating logic in the detection workflow (`fail_min_severity`).
+- Remediation scoping via `--min-severity`.
+
+### Meaning of Levels
+| Severity | Typical Use Cases | Rationale for Priority |
+|----------|-------------------|-------------------------|
+| high     | Audit / security logging disabled (e.g., `pgaudit.log`), mandatory audit role mis-set (`pgaudit.role`), critical error log export missing, required library (`shared_preload_libraries` subset) missing | Directly impacts audit/compliance visibility or foundational telemetry |
+| medium   | Important visibility but not core audit (e.g., connection / disconnection logging, general log, slow query log presence depending on workload) | Aids troubleshooting and performance insight; still actionable but not a blocker |
+| low      | Tuning / verbosity / optimization guidance (e.g., `long_query_time` threshold, output format) | Nice-to-have improvements; safe to defer |
+| unknown  | No severity mapping provided in baseline | Treated as lowest priority unless updated |
+
+You can add new levels (e.g., `critical`) if desired—detection will pass them through; update gating logic if you want distinct behavior.
+
+### Customizing Severities
+Edit `baselines/rds-baseline.json` under each engine:
+```jsonc
+"severity": {
+  "parameters": { "slow_query_log": "high", "general_log": "medium" },
+  "exports": { "error": "high", "general": "medium", "slowquery": "low" }
+}
+```
+For Aurora cluster-level parameters use `clusterParameters` inside severity.
+
+### How Detection Uses Them
+Detection assigns `severity` to each deviation. Totals are aggregated as:
+```json
+"severityTotals": {"high": 2, "medium": 3, "low": 1, "unknown": 0}
+```
+
+### Workflow Gating
+In the detection workflow dispatch inputs:
+- `fail_on_drift=true|false` decides whether any eligible drift can fail the run.
+- `fail_min_severity=low|medium|high` sets the *minimum* severity that triggers failure.
+  - `low`: any drift fails.
+  - `medium`: only medium or high drift fails.
+  - `high`: only high drift fails.
+
+### Remediation Phasing
+`dam-remediation.py --min-severity <level>` allows progressive rollout:
+1. Start with `--min-severity high` to fix critical gaps.
+2. Move to `medium` once high deviations are eliminated.
+3. Finish with `low` for full alignment.
+
+### When to Reclassify
+Promote a setting to a higher severity if:
+- It enables/ensures audit logging required for regulatory frameworks.
+- Its absence materially increases mean time to detect (MTTD) incidents.
+Demote if the signal is too noisy or cost-intensive (e.g., general log on very high throughput systems) and you plan a different control.
+
+### Adding a New Severity Level (Optional)
+1. Add the label in baseline severity maps.
+2. Update detection workflow gating bash case to handle the new label.
+3. Optionally adjust remediation threshold choices (`choices=["low","medium","high"]`).
+
+### Quick Reference
+| Task | File / Flag | Effect |
+|------|-------------|--------|
+| Change severity of a parameter | `baselines/rds-baseline.json` | Alters classification next detection run |
+| Fail build only if high drift | workflow_dispatch input `fail_min_severity=high` | Medium/low ignored for failure |
+| Dry-run remediation only for high | `dam-remediation.py --min-severity high` | Medium/low deviations skipped |
+| Full enforcement | `fail_min_severity=low` + remediation with `--min-severity low` | All deviations treated |
+
+If a deviation lacks a severity mapping it will appear as `unknown`; consider adding it or explicitly deciding to ignore it.
+
 Scripts
 
 dam-detection.py
