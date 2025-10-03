@@ -1,6 +1,6 @@
 import os, json, sys, argparse
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, NoCredentialsError
 
 def assume_role(role_arn: str, region: str):
     sts = boto3.client("sts", region_name=region)
@@ -89,13 +89,27 @@ def main():
     ap = argparse.ArgumentParser(description="Detect deviations from RDS baseline.")
     ap.add_argument("--baseline", required=True, help="Path to baseline JSON file")
     ap.add_argument("--region", required=True)
-    ap.add_argument("--account-role-arn", required=True, help="Role to assume in the target account")
+    ap.add_argument("--account-role-arn", required=False, help="Role to assume in the target account (omit to use ambient credentials)")
+    ap.add_argument("--use-current-credentials", action="store_true", help="Do not call STS AssumeRole; use the already provided ambient credentials")
     ap.add_argument("--output", default="detect-report.json")
     ap.add_argument("--check-log-groups", action="store_true", help="Also detect missing CloudWatch log groups for currently enabled exports")
     args = ap.parse_args()
 
     baseline = load_baseline(args.baseline)
-    session = assume_role(args.account_role_arn, args.region)
+    # Decide how to obtain a session
+    if args.use_current_credentials or not args.account_role_arn:
+        try:
+            # Validate we at least have some caller identity
+            session = boto3.session.Session(region_name=args.region)
+            _ = session.client("sts").get_caller_identity()
+        except NoCredentialsError:
+            print("ERROR: No ambient AWS credentials and no --account-role-arn provided", file=sys.stderr)
+            sys.exit(1)
+        except ClientError as e:
+            print(f"ERROR: Unable to validate ambient credentials: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        session = assume_role(args.account_role_arn, args.region)
     rds = session.client("rds")
     logs = session.client("logs")
 
