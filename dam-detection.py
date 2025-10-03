@@ -118,7 +118,7 @@ def main():
     tag_key = selection.get("tagKey")
     tag_val = selection.get("tagValue")
 
-    report = {"account": None, "region": args.region, "instances": [], "clusters": []}
+    report = {"account": None, "region": args.region, "schemaVersion": baseline.get("schemaVersion", 1), "instances": [], "clusters": []}
     sts = session.client("sts")
     report["account"] = sts.get_caller_identity()["Account"]
 
@@ -127,6 +127,25 @@ def main():
     total_export_drifts = 0
     total_log_group_drifts = 0
     objects_with_drift = 0
+
+    severity_totals = {"high": 0, "medium": 0, "low": 0, "unknown": 0}
+
+    # Helper to fetch severity for a deviation
+    def classify(engine_key: str, scope: str, kind: str, name: str):
+        eng = baseline.get("engines", {}).get(engine_key, {})
+        sev_map = eng.get("severity", {})
+        # scope may distinguish clusterParameters vs parameters
+        if kind == "parameter":
+            if scope == "cluster":
+                return sev_map.get("clusterParameters", {}).get(name) or sev_map.get("parameters", {}).get(name)
+            return sev_map.get("parameters", {}).get(name)
+        if kind == "export":
+            return sev_map.get("exports", {}).get(name)
+        if kind == "log-group":
+            # log-group indirectly inherits export severity if we can parse last token
+            token = name.rsplit('/', 1)[-1] if '/' in name else name
+            return sev_map.get("exports", {}).get(token)
+        return None
 
     # Instances
     for db in list_all_instances(rds):
@@ -148,18 +167,22 @@ def main():
             if not pg.startswith("default.") or not baseline["rules"].get("skipDefaultParameterGroups", True):
                 current = gather_params(rds, pg)
                 for k, v in (base.get("parameters") or {}).items():
-                    if str(current.get(k)) != str(v):
-                        dev["deviations"].append({"kind": "parameter", "name": k, "current": current.get(k), "expected": v, "pg": pg})
+                    cur_val = current.get(k)
+                    if str(cur_val) != str(v):
+                        sev = classify(engine_key, "instance", "parameter", k) or "unknown"
+                        dev["deviations"].append({"kind": "parameter", "scope": "instance", "name": k, "current": cur_val, "expected": v, "pg": pg, "severity": sev})
         # Exports (instance-level)
         current_exports = set(db.get("EnabledCloudwatchLogsExports") or [])
         for needed in set(base.get("exports") or []):
             if needed not in current_exports:
-                dev["deviations"].append({"kind": "export", "scope": "instance", "name": needed, "current": list(current_exports), "expected": base["exports"]})
+                sev = classify(engine_key, "instance", "export", needed) or "unknown"
+                dev["deviations"].append({"kind": "export", "scope": "instance", "name": needed, "current": list(current_exports), "expected": base["exports"], "severity": sev})
         # Missing log groups for currently enabled exports (optional)
         if args.check_log_groups and current_exports:
             for lg in expected_instance_log_groups(db["DBInstanceIdentifier"], sorted(current_exports)):
                 if not cw_log_group_exists(logs, lg):
-                    dev["deviations"].append({"kind": "log-group", "scope": "instance", "logGroup": lg, "reason": "enabled export has no log group"})
+                    sev = classify(engine_key, "instance", "log-group", lg) or "unknown"
+                    dev["deviations"].append({"kind": "log-group", "scope": "instance", "logGroup": lg, "reason": "enabled export has no log group", "severity": sev})
         if dev["deviations"]:
             for d in dev["deviations"]:
                 if d["kind"] == "parameter":
@@ -168,6 +191,8 @@ def main():
                     total_export_drifts += 1
                 elif d["kind"] == "log-group":
                     total_log_group_drifts += 1
+                sev = d.get("severity") or "unknown"
+                severity_totals[sev] = severity_totals.get(sev, 0) + 1
             objects_with_drift += 1
             report["instances"].append(dev)
 
@@ -190,20 +215,24 @@ def main():
                     want_set = set(x.strip() for x in str(v).split(',') if x.strip())
                     have_set = set(x.strip() for x in str(cur_val).split(',') if x.strip())
                     if not want_set.issubset(have_set):
-                        dev["deviations"].append({"kind": "parameter", "scope": "cluster", "name": k, "current": cur_val, "expected": v, "pg": pg, "comparison": "subset"})
+                        sev = classify(engine_key, "cluster", "parameter", k) or "unknown"
+                        dev["deviations"].append({"kind": "parameter", "scope": "cluster", "name": k, "current": cur_val, "expected": v, "pg": pg, "comparison": "subset", "severity": sev})
                     continue
                 if cur_val is None or str(cur_val) != str(v):
-                    dev["deviations"].append({"kind": "parameter", "scope": "cluster", "name": k, "current": cur_val, "expected": v, "pg": pg})
+                    sev = classify(engine_key, "cluster", "parameter", k) or "unknown"
+                    dev["deviations"].append({"kind": "parameter", "scope": "cluster", "name": k, "current": cur_val, "expected": v, "pg": pg, "severity": sev})
         # Cluster exports
         current_exports = set(cl.get("EnabledCloudwatchLogsExports") or [])
         for needed in set(base.get("exports") or []):
             if needed not in current_exports:
-                dev["deviations"].append({"kind": "export", "scope": "cluster", "name": needed, "current": list(current_exports), "expected": base["exports"]})
+                sev = classify(engine_key, "cluster", "export", needed) or "unknown"
+                dev["deviations"].append({"kind": "export", "scope": "cluster", "name": needed, "current": list(current_exports), "expected": base["exports"], "severity": sev})
         # Missing cluster log groups for currently enabled exports (optional)
         if args.check_log_groups and current_exports:
             for lg in expected_cluster_log_groups(cl["DBClusterIdentifier"], sorted(current_exports)):
                 if not cw_log_group_exists(logs, lg):
-                    dev["deviations"].append({"kind": "log-group", "scope": "cluster", "logGroup": lg, "reason": "enabled export has no log group"})
+                    sev = classify(engine_key, "cluster", "log-group", lg) or "unknown"
+                    dev["deviations"].append({"kind": "log-group", "scope": "cluster", "logGroup": lg, "reason": "enabled export has no log group", "severity": sev})
         if dev["deviations"]:
             for d in dev["deviations"]:
                 if d["kind"] == "parameter":
@@ -212,6 +241,8 @@ def main():
                     total_export_drifts += 1
                 elif d["kind"] == "log-group":
                     total_log_group_drifts += 1
+                sev = d.get("severity") or "unknown"
+                severity_totals[sev] = severity_totals.get(sev, 0) + 1
             objects_with_drift += 1
             report["clusters"].append(dev)
 
@@ -224,7 +255,8 @@ def main():
         "paramDrifts": total_param_drifts,
         "exportDrifts": total_export_drifts,
         "logGroupDrifts": total_log_group_drifts,
-        "hasDrift": bool(report["instances"] or report["clusters"])
+        "hasDrift": bool(report["instances"] or report["clusters"]),
+        "severityTotals": severity_totals
     }
     with open(args.summary_output, "w", encoding="utf-8") as sf:
         json.dump(summary, sf, indent=2)
