@@ -100,10 +100,15 @@ Resources:
               - rds:ModifyDBParameterGroup
               - rds:ModifyDBClusterParameterGroup
             Resource: '*'
-          - Sid: LogsAccess
+          # CloudWatch Logs: DescribeLogGroups does not support resource-level scoping, so always grant with Resource '*'
+          - Sid: LogsDescribe
             Effect: Allow
-            Action: !If [AllowLogGroupMgmt, [logs:DescribeLogGroups, logs:CreateLogGroup, logs:PutRetentionPolicy, logs:TagLogGroup], [logs:DescribeLogGroups]]
-            Resource: !If [AllowLogGroupMgmt, 'arn:aws:logs:*:*:log-group:/aws/rds/*', '*']
+            Action: [logs:DescribeLogGroups]
+            Resource: '*'
+          - !If
+            - AllowLogGroupMgmt
+            - { Sid: LogsManage, Effect: Allow, Action: [logs:CreateLogGroup, logs:PutRetentionPolicy, logs:TagLogGroup], Resource: '*' }
+            - !Ref 'AWS::NoValue'
           - Sid: CallerIdentity
             Effect: Allow
             Action: [sts:GetCallerIdentity]
