@@ -32,9 +32,9 @@ jobs:
           accounts='${{ inputs.accounts }}'
           regions_json=$(echo "$regions" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R -s -c 'split("\n")|map(select(length>0))')
           accounts_json=$(echo "$accounts" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R -s -c 'split("\n")|map(select(length>0))')
-          matrix=$(jq -n --argjson regions "$regions_json" --argjson roles "$accounts_json" '
-            {include: [ foreach $regions[] as $r ([]; .; foreach $roles[] as $role ([]; .; {region:$r, role:$role}) ) ] }')
-          echo "Matrix: $matrix"
+          # Build cartesian product and ensure compact single-line JSON to satisfy GitHub output formatting
+          matrix=$(jq -c -n --argjson regions "$regions_json" --argjson roles "$accounts_json" '{include: [ $regions[] as $r | $roles[] as $role | {region:$r, role:$role} ] }')
+          echo "Matrix (compact): $matrix"
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
   detect:
     runs-on: ubuntu-latest
