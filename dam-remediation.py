@@ -64,6 +64,7 @@ def main():
     ap.add_argument("--apply", action="store_true", help="Actually apply changes (otherwise dry-run)")
     ap.add_argument("--ensure-log-groups", action="store_true", help="Also create missing CloudWatch log groups for enabled exports")
     ap.add_argument("--log-retention-days", type=int, default=30, help="Retention for created log groups")
+    ap.add_argument("--min-severity", default="low", choices=["low","medium","high"], help="Minimum deviation severity to remediate (default: low)")
     args = ap.parse_args()
     dry_run = not args.apply
 
@@ -72,6 +73,9 @@ def main():
     session = assume_role(args.account_role_arn, args.region)
     rds = session.client("rds")
     logs = session.client("logs")
+
+    severity_rank = {"high":3, "medium":2, "low":1, "unknown":0}
+    threshold = severity_rank.get(args.min_severity, 1)
 
     # Instances
     for inst in report.get("instances", []):
@@ -84,11 +88,13 @@ def main():
             param_deltas = []
             for dev in inst["deviations"]:
                 if dev["kind"] == "parameter":
+                    if severity_rank.get(dev.get("severity","unknown"),0) < threshold:
+                        continue
                     apply_method = "immediate"  # keep simple; static will mark pending-reboot server-side
                     param_deltas.append({"ParameterName": dev["name"], "ParameterValue": str(dev["expected"]), "ApplyMethod": apply_method})
             apply_instance_params(rds, pg, param_deltas, dry_run)
         # Exports (instance-level)
-        exports = [d["name"] for d in inst["deviations"] if d["kind"] == "export" and d.get("scope") == "instance"]
+        exports = [d["name"] for d in inst["deviations"] if d["kind"] == "export" and d.get("scope") == "instance" and severity_rank.get(d.get("severity","unknown"),0) >= threshold]
         if exports and not dry_run:
             # Backoff if busy
             for attempt in range(5):
@@ -107,7 +113,7 @@ def main():
                     raise
         # Create missing log groups if detection reported them or if --ensure-log-groups is set
         if not dry_run:
-            missing_lgs = [d["logGroup"] for d in inst["deviations"] if d.get("kind") == "log-group"]
+            missing_lgs = [d["logGroup"] for d in inst["deviations"] if d.get("kind") == "log-group" and severity_rank.get(d.get("severity","unknown"),0) >= threshold]
             if args.ensure_log_groups:
                 # Derive for current exports (if any were enabled previously or just now)
                 derived = expected_instance_log_groups(db_id, sorted(set((db.get("EnabledCloudwatchLogsExports") or []) + exports)))
@@ -131,10 +137,12 @@ def main():
         cluster_deltas = []
         for dev in cl["deviations"]:
             if dev["kind"] == "parameter" and dev.get("scope") == "cluster":
+                if severity_rank.get(dev.get("severity","unknown"),0) < threshold:
+                    continue
                 cluster_deltas.append({"ParameterName": dev["name"], "ParameterValue": str(dev["expected"]), "ApplyMethod": "immediate"})
         apply_cluster_params(rds, pg, cluster_deltas, dry_run)
         # Cluster exports
-        exports = [d["name"] for d in cl["deviations"] if d["kind"] == "export" and d.get("scope") == "cluster"]
+        exports = [d["name"] for d in cl["deviations"] if d["kind"] == "export" and d.get("scope") == "cluster" and severity_rank.get(d.get("severity","unknown"),0) >= threshold]
         if exports and not dry_run:
             for attempt in range(5):
                 try:
@@ -152,7 +160,7 @@ def main():
                     raise
         # Create missing cluster log groups
         if not dry_run:
-            missing_lgs = [d["logGroup"] for d in cl["deviations"] if d.get("kind") == "log-group"]
+            missing_lgs = [d["logGroup"] for d in cl["deviations"] if d.get("kind") == "log-group" and severity_rank.get(d.get("severity","unknown"),0) >= threshold]
             if args.ensure_log_groups:
                 derived = expected_cluster_log_groups(cluster_id, sorted(set((cluster.get("EnabledCloudwatchLogsExports") or []) + exports)))
                 missing_lgs.extend(derived)
@@ -166,7 +174,7 @@ def main():
             if created:
                 print(f"{cluster_id}: created cluster log groups: {created}")
 
-    print("Remediation completed (dry-run)" if dry_run else "Remediation applied")
+    print(("Remediation completed (dry-run)" if dry_run else "Remediation applied") + f" (min severity: {args.min_severity})")
 
 if __name__ == "__main__":
     main()
