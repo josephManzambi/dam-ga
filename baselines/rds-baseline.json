@@ -1,4 +1,5 @@
 {
+	"schemaVersion": 1,
 	"engines": {
 		"rds/mysql": {
 			"parameters": {
@@ -7,7 +8,20 @@
 				"log_output": "FILE",
 				"general_log": "1"
 			},
-			"exports": ["error", "general", "slowquery"]
+			"exports": ["error", "general", "slowquery"],
+			"severity": {
+				"parameters": {
+					"slow_query_log": "high",
+					"general_log": "medium",
+					"long_query_time": "low",
+					"log_output": "low"
+				},
+				"exports": {
+					"error": "high",
+					"general": "medium",
+					"slowquery": "low"
+				}
+			}
 		},
 		"rds/aurora-postgresql": {
 			"clusterParameters": {
@@ -18,31 +32,60 @@
 				"log_disconnections": "1",
 				"log_error_verbosity": "default"
 			},
-			"exports": ["postgresql"]
+			"exports": ["postgresql"],
+			"severity": {
+				"clusterParameters": {
+					"pgaudit.role": "high",
+					"shared_preload_libraries": "high",
+					"pgaudit.log": "high",
+					"log_connections": "medium",
+					"log_disconnections": "medium",
+					"log_error_verbosity": "low"
+				},
+				"exports": {
+					"postgresql": "high"
+				}
+			}
 		},
 		"rds/sqlserver-ex": {
 			"parameters": {
 				"default language": "0"
 			},
-			"exports": ["error"]
+			"exports": ["error"],
+			"severity": {
+				"parameters": {"default language": "low"},
+				"exports": {"error": "high"}
+			}
 		},
 		"rds/sqlserver-web": {
 			"parameters": {
 				"default language": "0"
 			},
-			"exports": ["error"]
+			"exports": ["error"],
+			"severity": {
+				"parameters": {"default language": "low"},
+				"exports": {"error": "high"}
+			}
 		},
 		"rds/sqlserver-se": {
 			"parameters": {
 				"default language": "0"
 			},
-			"exports": ["error"]
+			"exports": ["error"],
+			"severity": {
+				"parameters": {"default language": "low"},
+				"exports": {"error": "high"}
+			}
 		},
 		"rds/sqlserver-ee": {
 			"parameters": {
 				"default language": "0"
 			},
-			"exports": ["error"]
+			"exports": ["error"],
+			"severity": {
+				"parameters": {"default language": "low"},
+				"exports": {"error": "high"}
+			}
 		}
 	},
 	"selection": {
