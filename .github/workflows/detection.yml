@@ -1,0 +1,107 @@
+name: RDS Compliance Detection
+
+on:
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: "Comma-separated AWS regions (e.g. eu-west-1,us-east-1)"
+        required: true
+        default: "eu-west-1"
+      accounts:
+        description: "Comma-separated detection role ARNs (one per account)"
+        required: true
+  schedule:
+    - cron: "0 3 * * *"  # daily 03:00 UTC
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - name: Build dynamic matrix
+        id: build
+        shell: bash
+        run: |
+          set -e
+          regions='${{ inputs.regions }}'
+          accounts='${{ inputs.accounts }}'
+          regions_json=$(echo "$regions" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R -s -c 'split("\n")|map(select(length>0))')
+          accounts_json=$(echo "$accounts" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R -s -c 'split("\n")|map(select(length>0))')
+          matrix=$(jq -n --argjson regions "$regions_json" --argjson roles "$accounts_json" '
+            {include: [ foreach $regions[] as $r ([]; .; foreach $roles[] as $role ([]; .; {region:$r, role:$role}) ) ] }')
+          echo "Matrix: $matrix"
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+  detect:
+    runs-on: ubuntu-latest
+    needs: prepare-matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix).include }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Configure AWS credentials (assume detection role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.role }}
+          aws-region: ${{ matrix.region }}
+      - name: Show caller identity
+        run: aws sts get-caller-identity
+      - name: Run detection
+        shell: bash
+        run: |
+          set -e
+          mkdir -p reports
+          acct=$(echo "${{ matrix.role }}" | awk -F: '{print $5}')
+          echo "--- Detection for account $acct role ${{ matrix.role }} region ${{ matrix.region }} ---"
+          python ./dam-detection.py \
+            --baseline baselines/rds-baseline.json \
+            --region "${{ matrix.region }}" \
+            --use-current-credentials \
+            --check-log-groups \
+            --output "reports/detect-${acct}-${{ matrix.region }}.json" || echo "WARNING: detection script non-zero (allowed)"
+          ls -l reports || true
+      - name: Upload per-account report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: detect-report-${{ matrix.region }}-${{ strategy.job-index }}
+          path: reports/
+
+  aggregate:
+    runs-on: ubuntu-latest
+    needs: detect
+    steps:
+      - name: Download all per-account artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-reports
+      - name: Combine reports
+        shell: bash
+        run: |
+          set -e
+          mkdir -p combined
+          found=$(find all-reports -type f -name 'detect-*.json' | wc -l | tr -d ' ')
+          if [ "$found" = "0" ]; then
+            echo '::warning ::No detection reports found to aggregate.'
+            echo '[]' > combined/all-detect.json
+          else
+            jq -s '.' all-reports/**/detect-*.json > combined/all-detect.json || echo '[]' > combined/all-detect.json
+          fi
+          ls -1 combined
+      - name: Upload aggregated reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: detect-reports
+          path: combined/
