@@ -12,7 +12,7 @@
 		"rds/aurora-postgresql": {
 			"clusterParameters": {
 				"pgaudit.role": "rds_pgaudit",
-				"shared_preload_libraries": "pgaudit",
+				"shared_preload_libraries": "pg_stat_statements,pgaudit",
 				"pgaudit.log": "all",
 				"log_connections": "1",
 				"log_disconnections": "1",
