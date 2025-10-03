@@ -94,12 +94,18 @@ jobs:
         run: |
           set -e
           mkdir -p combined
-          found=$(find all-reports -type f -name 'detect-*.json' | wc -l | tr -d ' ')
+          if [ ! -d all-reports ]; then
+            echo '::warning ::Artifact directory all-reports not found (no per-account artifacts downloaded).'
+            echo '[]' > combined/all-detect.json
+            ls -1 combined
+            exit 0
+          fi
+          found=$(find all-reports -type f -name 'detect-*.json' 2>/dev/null | wc -l | tr -d ' ')
           if [ "$found" = "0" ]; then
             echo '::warning ::No detection reports found to aggregate.'
             echo '[]' > combined/all-detect.json
           else
-            jq -s '.' all-reports/**/detect-*.json > combined/all-detect.json || echo '[]' > combined/all-detect.json
+            jq -s '.' $(find all-reports -type f -name 'detect-*.json' -print) > combined/all-detect.json || echo '[]' > combined/all-detect.json
           fi
           ls -1 combined
       - name: Upload aggregated reports
