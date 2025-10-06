@@ -1,6 +1,6 @@
 # RDS Compliance – Detection and Remediation
 
-Overview
+## Overview
 - Goal: Detect and optionally remediate deviations from an RDS logging/parameter baseline across multiple AWS accounts without deploying infrastructure.
 - Content:
   - A JSON baseline file managed in Git.
@@ -9,7 +9,7 @@ Overview
     - dam-remediation.py: optional remediation (applies changes).
   - GitHub Actions workflows (optional) to run detection on schedule and remediation on demand via OIDC and AssumeRole.
 
-Repository structure
+## Repository structure
 - baselines/rds-baseline.json – baseline parameters & exports with severity.
 - dam-detection.py / dam-remediation.py – detection & remediation scripts.
 - iam-rds-compliance-roles.yaml – OIDC detection & remediation roles.
@@ -298,5 +298,6 @@ aws cloudformation wait stack-delete-complete --stack-name rds-compliance-test -
 ```
 
 Optional: extend the stack with additional engines or remove unneeded ones to minimize cost footprint.
+
 
 
