@@ -1,6 +1,6 @@
-import os, json, argparse, time
+import json, argparse, time, sys, re, hashlib
 import boto3
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, NoCredentialsError
 
 def assume_role(role_arn: str, region: str):
     sts = boto3.client("sts", region_name=region)
@@ -11,6 +11,35 @@ def assume_role(role_arn: str, region: str):
         aws_session_token=creds["SessionToken"],
         region_name=region
     )
+
+TOOL_VERSION = "1.1.0"  # Align with detection
+SENSITIVE_PARAM_PATTERN = re.compile(r"(password|secret|token|key|credential)", re.I)
+
+def mask_value(name, value):
+    if value is None:
+        return None
+    if SENSITIVE_PARAM_PATTERN.search(name or ""):
+        return "***MASKED***"
+    return value
+
+def compute_file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def validate_baseline(baseline: dict):
+    if not isinstance(baseline, dict):
+        raise ValueError("Baseline root must be object")
+    if "engines" not in baseline or not isinstance(baseline["engines"], dict) or not baseline["engines"]:
+        raise ValueError("Baseline missing non-empty 'engines'")
+    for eng_name, eng_def in baseline["engines"].items():
+        if not isinstance(eng_def, dict):
+            raise ValueError(f"Engine '{eng_name}' def must be object")
+        if not any(k in eng_def for k in ("parameters", "clusterParameters", "exports")):
+            raise ValueError(f"Engine '{eng_name}' has no parameters/clusterParameters/exports")
+    return True
 
 def chunk(lst, n):
     for i in range(0, len(lst), n):
@@ -60,26 +89,76 @@ def main():
     ap.add_argument("--baseline", required=True)
     ap.add_argument("--report", required=True, help="Path to detect-report.json")
     ap.add_argument("--region", required=True)
-    ap.add_argument("--account-role-arn", required=True)
+    cred_group = ap.add_mutually_exclusive_group(required=True)
+    cred_group.add_argument("--account-role-arn", help="Role to assume in the target account")
+    cred_group.add_argument("--use-current-credentials", action="store_true", help="Use ambient credentials")
     ap.add_argument("--apply", action="store_true", help="Actually apply changes (otherwise dry-run)")
     ap.add_argument("--ensure-log-groups", action="store_true", help="Also create missing CloudWatch log groups for enabled exports")
     ap.add_argument("--log-retention-days", type=int, default=30, help="Retention for created log groups")
     ap.add_argument("--min-severity", default="low", choices=["low","medium","high"], help="Minimum deviation severity to remediate (default: low)")
+    ap.add_argument("--fail-on-unknown-severity", action="store_true", help="Fail if unknown severity deviations meet threshold")
     args = ap.parse_args()
     dry_run = not args.apply
 
-    baseline = json.load(open(args.baseline, "r", encoding="utf-8"))
-    report = json.load(open(args.report, "r", encoding="utf-8"))
-    session = assume_role(args.account_role_arn, args.region)
+    try:
+        baseline = json.load(open(args.baseline, "r", encoding="utf-8"))
+        validate_baseline(baseline)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: Baseline invalid: {e}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        report = json.load(open(args.report, "r", encoding="utf-8"))
+    except OSError as e:
+        print(f"ERROR: Unable to read report: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Acquire session
+    if args.account_role_arn:
+        try:
+            session = assume_role(args.account_role_arn, args.region)
+        except ClientError as e:
+            print(f"ERROR: AssumeRole failed: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        try:
+            session = boto3.session.Session(region_name=args.region)
+            session.client("sts").get_caller_identity()
+        except NoCredentialsError:
+            print("ERROR: No ambient credentials", file=sys.stderr)
+            sys.exit(1)
+        except ClientError as e:
+            print(f"ERROR: Ambient credential validation failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
     rds = session.client("rds")
     logs = session.client("logs")
 
     severity_rank = {"high":3, "medium":2, "low":1, "unknown":0}
     threshold = severity_rank.get(args.min_severity, 1)
 
+    # Helper to get baseline expected value (unmasked) for a deviation
+    def desired_value_for(dev):
+        eng = dev.get("engine") or dev.get("engineKey")
+        # dev doesn't contain engine for each deviation; inherit from parent context
+        return None
+
+    engines = baseline.get("engines", {})
+    def fetch_baseline_value(engine_key: str, scope: str, kind: str, name: str):
+        eng_def = engines.get(engine_key, {})
+        if kind == "parameter":
+            if scope == "cluster":
+                return (eng_def.get("clusterParameters") or {}).get(name)
+            return (eng_def.get("parameters") or {}).get(name)
+        if kind == "export":
+            return name  # exports enabling only needs the name
+        return None
+
+    unknown_severity_flagged = False
+
     # Instances
     for inst in report.get("instances", []):
         db_id = inst["db"]
+        engine_key = f"rds/{inst.get('engine') }"
         # Gather current describe each loop
         db = rds.describe_db_instances(DBInstanceIdentifier=db_id)["DBInstances"][0]
         # Parameters
@@ -88,13 +167,26 @@ def main():
             param_deltas = []
             for dev in inst["deviations"]:
                 if dev["kind"] == "parameter":
-                    if severity_rank.get(dev.get("severity","unknown"),0) < threshold:
+                    sev = dev.get("severity", "unknown")
+                    if sev == "unknown":
+                        unknown_severity_flagged = True
+                    if severity_rank.get(sev,0) < threshold:
                         continue
-                    apply_method = "immediate"  # keep simple; static will mark pending-reboot server-side
-                    param_deltas.append({"ParameterName": dev["name"], "ParameterValue": str(dev["expected"]), "ApplyMethod": apply_method})
+                    desired = fetch_baseline_value(engine_key, "instance", "parameter", dev["name"])
+                    if desired is None:
+                        continue  # skip if not in baseline anymore
+                    apply_method = "immediate"
+                    param_deltas.append({"ParameterName": dev["name"], "ParameterValue": str(desired), "ApplyMethod": apply_method})
             apply_instance_params(rds, pg, param_deltas, dry_run)
         # Exports (instance-level)
-        exports = [d["name"] for d in inst["deviations"] if d["kind"] == "export" and d.get("scope") == "instance" and severity_rank.get(d.get("severity","unknown"),0) >= threshold]
+        exports = []
+        for d in inst["deviations"]:
+            if d["kind"] == "export" and d.get("scope") == "instance":
+                sev = d.get("severity", "unknown")
+                if sev == "unknown":
+                    unknown_severity_flagged = True
+                if severity_rank.get(sev,0) >= threshold:
+                    exports.append(d["name"])
         if exports and not dry_run:
             # Backoff if busy
             for attempt in range(5):
@@ -131,18 +223,32 @@ def main():
     # Clusters
     for cl in report.get("clusters", []):
         cluster_id = cl["cluster"]
+        engine_key = "rds/aurora-postgresql"
         cluster = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]
         # Cluster parameters
         pg = cluster.get("DBClusterParameterGroup")
         cluster_deltas = []
         for dev in cl["deviations"]:
             if dev["kind"] == "parameter" and dev.get("scope") == "cluster":
-                if severity_rank.get(dev.get("severity","unknown"),0) < threshold:
+                sev = dev.get("severity", "unknown")
+                if sev == "unknown":
+                    unknown_severity_flagged = True
+                if severity_rank.get(sev,0) < threshold:
                     continue
-                cluster_deltas.append({"ParameterName": dev["name"], "ParameterValue": str(dev["expected"]), "ApplyMethod": "immediate"})
+                desired = fetch_baseline_value(engine_key, "cluster", "parameter", dev["name"])
+                if desired is None:
+                    continue
+                cluster_deltas.append({"ParameterName": dev["name"], "ParameterValue": str(desired), "ApplyMethod": "immediate"})
         apply_cluster_params(rds, pg, cluster_deltas, dry_run)
         # Cluster exports
-        exports = [d["name"] for d in cl["deviations"] if d["kind"] == "export" and d.get("scope") == "cluster" and severity_rank.get(d.get("severity","unknown"),0) >= threshold]
+        exports = []
+        for d in cl["deviations"]:
+            if d["kind"] == "export" and d.get("scope") == "cluster":
+                sev = d.get("severity", "unknown")
+                if sev == "unknown":
+                    unknown_severity_flagged = True
+                if severity_rank.get(sev,0) >= threshold:
+                    exports.append(d["name"])
         if exports and not dry_run:
             for attempt in range(5):
                 try:
@@ -174,6 +280,9 @@ def main():
             if created:
                 print(f"{cluster_id}: created cluster log groups: {created}")
 
+    if args.fail_on_unknown_severity and unknown_severity_flagged and severity_rank.get(args.min_severity,1) <= 1:
+        print("ERROR: Unknown severity deviations encountered and --fail-on-unknown-severity specified", file=sys.stderr)
+        sys.exit(3)
     print(("Remediation completed (dry-run)" if dry_run else "Remediation applied") + f" (min severity: {args.min_severity})")
 
 if __name__ == "__main__":
