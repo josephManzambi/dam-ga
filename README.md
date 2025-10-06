@@ -1,8 +1,8 @@
-# RDS Compliance – Detection and Remediation (No-Infrastructure)
+# RDS Compliance – Detection and Remediation
 
 Overview
 - Goal: Detect and optionally remediate deviations from an RDS logging/parameter baseline across multiple AWS accounts without deploying infrastructure.
-- This project replaces the previous test stack (CloudFormation + Lambda + DynamoDB) with:
+- Content:
   - A JSON baseline file managed in Git.
   - Two Python scripts:
     - dam-detection.py: non-destructive detection (reports deviations).
@@ -243,10 +243,6 @@ Troubleshooting
 - Default parameter groups:
   - If your environments use default.* groups but you still want to enforce values, set rules.skipDefaultParameterGroups = false (note: many defaults are immutable).
 
-License and contributions
-- (Add a LICENSE file if distributing publicly.)
-- PRs/issues welcome. Do not include secrets or account IDs in examples.
- 
 ## IAM Roles (GitHub Actions OIDC)
 
 Use the `iam-rds-compliance-roles.yaml` template to deploy detection and remediation roles.
@@ -302,4 +298,5 @@ aws cloudformation wait stack-delete-complete --stack-name rds-compliance-test -
 ```
 
 Optional: extend the stack with additional engines or remove unneeded ones to minimize cost footprint.
+
 
