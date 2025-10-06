@@ -1,15 +1,15 @@
 # RDS Compliance – Detection and Remediation
 
-## Overview
-- Goal: Detect and optionally remediate deviations from an RDS logging/parameter baseline across multiple AWS accounts without deploying infrastructure.
-- Content:
+Overview
+- Goal: Detect and optionally remediate deviations from an RDS logging/parameter baseline across multiple AWS accounts
+- This project replaces the previous test stack (CloudFormation + Lambda + DynamoDB) with:
   - A JSON baseline file managed in Git.
   - Two Python scripts:
     - dam-detection.py: non-destructive detection (reports deviations).
     - dam-remediation.py: optional remediation (applies changes).
   - GitHub Actions workflows (optional) to run detection on schedule and remediation on demand via OIDC and AssumeRole.
 
-## Repository structure
+Repository structure
 - baselines/rds-baseline.json – baseline parameters & exports with severity.
 - dam-detection.py / dam-remediation.py – detection & remediation scripts.
 - iam-rds-compliance-roles.yaml – OIDC detection & remediation roles.
@@ -139,23 +139,36 @@ Demote if the signal is too noisy or cost-intensive (e.g., general log on very h
 
 If a deviation lacks a severity mapping it will appear as `unknown`; consider adding it or explicitly deciding to ignore it.
 
-Scripts
+ Scripts
 
 dam-detection.py
 - Purpose: Non-destructive detection of deviations vs baseline.
 - What it checks:
   - Instance DB parameter groups vs engines["rds/<engine>"].parameters (if not default.* or if skipDefaultParameterGroups=false).
-  - Instance EnabledCloudwatchLogsExports vs engines["..."].exports (MySQL, SQL Server).
-  - Aurora cluster parameter groups vs clusterParameters and cluster EnabledCloudwatchLogsExports.
+  - Instance EnabledCloudwatchLogsExports vs engines["..."].exports (MySQL, SQL Server) and optionally existence of matching CloudWatch log groups (`--check-log-groups`).
+  - Aurora cluster parameter groups vs clusterParameters and cluster EnabledCloudwatchLogsExports (plus log groups if flag set).
+- Key behaviors / safeguards (recent additions):
+  - Mutually exclusive credential flags: specify either `--account-role-arn` or `--use-current-credentials` (omitting both defaults to ambient credentials).
+  - Baseline structure validation: early failure with clear message if baseline is malformed.
+  - Sensitive value masking: any parameter name containing `password|secret|token|key|credential` (case-insensitive) is masked in the report (`***MASKED***`). Comparison still uses real values in-memory.
+  - Improved error transparency: Distinguishes AccessDenied vs other errors when listing tags / log groups (prints warnings instead of silently swallowing).
+  - Light retry logic on throttled RDS / tagging parameter calls (exponential backoff, 3 attempts).
+  - Core logic exposed via a reusable `detect()` function for easier unit testing / reuse.
 - Input arguments:
-  - --baseline: path to baseline JSON.
-  - --region: AWS region to scan.
-  - --account-role-arn: IAM role ARN to assume in the target account (OIDC).
-  - --output: output JSON report path (default detect-report.json).
+  - `--baseline` (required): path to baseline JSON.
+  - `--region` (required): AWS region to scan.
+  - `--account-role-arn` OR `--use-current-credentials`: choose auth strategy.
+  - `--output`: full JSON report path (default `detect-report.json`).
+  - `--summary-output`: summary counts path (default `detect-summary.json`).
+  - `--check-log-groups`: also detect missing CloudWatch log groups for currently enabled exports.
 - Output:
-  - Full JSON report (instances/clusters with deviations) plus per-object deviation severity.
+  - Full JSON report (instances/clusters with deviations) plus deviation severities.
   - Summary JSON (counts: paramDrifts, exportDrifts, logGroupDrifts, severityTotals, objectsWithDrift, hasDrift).
-  - Exit code 2 if deviations exist (CI will treat as failure unless overridden in workflow logic).
+  - Exit codes:
+    - 0: Success, no drift.
+    - 1: Baseline invalid / credential or assume-role error.
+    - 2: Drift detected.
+  - Warnings printed to stderr for permission issues (do not change exit code unless critical to detection integrity).
 
 Example (Windows PowerShell)
 ```powershell
@@ -164,6 +177,15 @@ python .\scripts\dam-detection.py `
   --region eu-west-1 `
   --account-role-arn arn:aws:iam::<ACCOUNT_ID>:role/RDSComplianceRole `
   --output .\reports\detect-<ACCOUNT_ID>-eu-west-1.json
+
+Example with ambient credentials (e.g., local profile) and log group checks:
+```powershell
+python .\dam-detection.py `
+  --baseline .\baselines\rds-baseline.json `
+  --region eu-west-1 `
+  --use-current-credentials `
+  --check-log-groups
+```
 ```
 
 dam-remediation.py
@@ -238,11 +260,21 @@ Operational guidance
 Troubleshooting
 - Access denied when assuming role:
   - Check the OIDC trust policy and that the role ARN matches. Ensure audience and subject conditions align with your org’s GitHub settings.
+- Baseline invalid error:
+  - The validator requires a non-empty `engines` object and at least one of `parameters`, `clusterParameters`, or `exports` per engine. Fix structural issues and re-run.
 - “previous configuration is in progress” on remediation:
   - Re-run later; the script includes backoff but may need time after prior changes.
 - Default parameter groups:
   - If your environments use default.* groups but you still want to enforce values, set rules.skipDefaultParameterGroups = false (note: many defaults are immutable).
+- Missing CloudWatch log group warnings:
+  - If you see many warnings with AccessDenied for log groups, ensure the scanning role has `logs:DescribeLogGroups`.
+- Masked values in report:
+  - Masking is name-based pattern matching. If a non-sensitive parameter is masked unexpectedly, rename baseline key if possible or adjust pattern (requires code edit).
 
+License and contributions
+- (Add a LICENSE file if distributing publicly.)
+- PRs/issues welcome. Do not include secrets or account IDs in examples.
+ 
 ## IAM Roles (GitHub Actions OIDC)
 
 Use the `iam-rds-compliance-roles.yaml` template to deploy detection and remediation roles.
@@ -298,6 +330,4 @@ aws cloudformation wait stack-delete-complete --stack-name rds-compliance-test -
 ```
 
 Optional: extend the stack with additional engines or remove unneeded ones to minimize cost footprint.
-
-
 
