@@ -1,4 +1,4 @@
-import json, sys, argparse, re, time
+import json, sys, argparse, re, time, hashlib
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 
@@ -77,6 +77,7 @@ def validate_baseline(baseline: dict):
     if "engines" not in baseline or not isinstance(baseline["engines"], dict) or not baseline["engines"]:
         raise ValueError("'engines' key must be a non-empty object")
     engines = baseline["engines"]
+    allowed_severity = {"high", "medium", "low", "unknown", "critical"}  # allow future 'critical'
     for eng_name, eng_def in engines.items():
         if not isinstance(eng_def, dict):
             raise ValueError(f"Engine '{eng_name}' definition must be an object")
@@ -89,11 +90,41 @@ def validate_baseline(baseline: dict):
         if "exports" in eng_def:
             if not isinstance(eng_def["exports"], list):
                 raise ValueError(f"Engine '{eng_name}' -> exports must be a list")
+            # Detect duplicates
+            if len(set(eng_def["exports"])) != len(eng_def["exports"]):
+                print(f"WARNING: Duplicate export names found in engine '{eng_name}'", file=sys.stderr)
             has_any = True
         if not has_any:
             raise ValueError(f"Engine '{eng_name}' must define at least one of parameters/clusterParameters/exports")
         if "severity" in eng_def and not isinstance(eng_def["severity"], dict):
             raise ValueError(f"Engine '{eng_name}' -> severity must be an object")
+        # Validate severity labels if present
+        sev = eng_def.get("severity") or {}
+        if sev:
+            for sev_section, mapping in sev.items():
+                if not isinstance(mapping, dict):
+                    raise ValueError(f"Engine '{eng_name}' severity section '{sev_section}' must be an object")
+                for name, level in mapping.items():
+                    if level not in allowed_severity:
+                        print(f"WARNING: Engine '{eng_name}' severity for '{name}' has non-standard level '{level}'", file=sys.stderr)
+        # Orphan severity references (names not present in parameters/clusterParameters/exports)
+        param_names = set((eng_def.get("parameters") or {}).keys())
+        cparam_names = set((eng_def.get("clusterParameters") or {}).keys())
+        export_names = set(eng_def.get("exports") or [])
+        sev_map = eng_def.get("severity") or {}
+        for section, mapping in sev_map.items():
+            if section == "parameters":
+                for n in mapping.keys():
+                    if n not in param_names:
+                        print(f"WARNING: Engine '{eng_name}' severity references parameter '{n}' not in parameters", file=sys.stderr)
+            elif section == "clusterParameters":
+                for n in mapping.keys():
+                    if n not in cparam_names:
+                        print(f"WARNING: Engine '{eng_name}' severity references clusterParameter '{n}' not in clusterParameters", file=sys.stderr)
+            elif section == "exports":
+                for n in mapping.keys():
+                    if n not in export_names:
+                        print(f"WARNING: Engine '{eng_name}' severity references export '{n}' not in exports", file=sys.stderr)
     # Optional types
     if "rules" in baseline and not isinstance(baseline["rules"], dict):
         raise ValueError("'rules' must be an object if provided")
@@ -129,7 +160,17 @@ def call_with_retries(fn, *args, retries: int = 3, backoff: float = 0.5, **kwarg
                 continue
             raise
 
-def detect(baseline: dict, session, region: str, check_log_groups: bool):
+TOOL_VERSION = "1.1.0"  # Update when logic changes materially
+REPORT_SCHEMA_VERSION = 1
+
+def compute_file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def detect(baseline: dict, session, region: str, check_log_groups: bool, baseline_hash: str):
     """Core detection logic extracted for testability.
 
     Returns (report, summary) tuple.
@@ -141,7 +182,11 @@ def detect(baseline: dict, session, region: str, check_log_groups: bool):
     tag_key = selection.get("tagKey")
     tag_val = selection.get("tagValue")
 
-    report = {"account": None, "region": region, "schemaVersion": baseline.get("schemaVersion", 1), "instances": [], "clusters": []}
+    report = {"account": None, "region": region, "schemaVersion": baseline.get("schemaVersion", 1),
+              "reportSchemaVersion": REPORT_SCHEMA_VERSION,
+              "toolVersion": TOOL_VERSION,
+              "baselineHash": f"sha256:{baseline_hash}",
+              "instances": [], "clusters": []}
     sts = session.client("sts")
     report["account"] = sts.get_caller_identity()["Account"]
 
@@ -166,6 +211,37 @@ def detect(baseline: dict, session, region: str, check_log_groups: bool):
             return sev_map.get("exports", {}).get(token)
         return None
 
+    # Helper: type-aware comparison
+    def values_differ(expected, current_raw):
+        if expected is None and current_raw is None:
+            return False
+        # If expected type is numeric
+        if isinstance(expected, bool):
+            if current_raw is None:
+                return True
+            s = str(current_raw).strip().lower()
+            truthy = {"1", "true", "t", "on", "yes"}
+            falsy = {"0", "false", "f", "off", "no"}
+            if s in truthy:
+                cur_val = True
+            elif s in falsy:
+                cur_val = False
+            else:
+                return True  # Unparseable -> difference
+            return cur_val != expected
+        if isinstance(expected, int) and not isinstance(expected, bool):  # bool is subclass int
+            try:
+                return int(str(current_raw).strip()) != expected
+            except (ValueError, TypeError):
+                return True
+        if isinstance(expected, float):
+            try:
+                return abs(float(str(current_raw).strip()) - expected) > 1e-9
+            except (ValueError, TypeError):
+                return True
+        # Fallback string compare (case sensitive by default)
+        return str(current_raw) != str(expected)
+
     # Instances
     for db in list_all_instances(rds):
         arn = db["DBInstanceArn"]
@@ -185,7 +261,7 @@ def detect(baseline: dict, session, region: str, check_log_groups: bool):
                 current = gather_params(rds, pg)
                 for k, v in (base.get("parameters") or {}).items():
                     cur_val = current.get(k)
-                    if str(cur_val) != str(v):
+                    if values_differ(v, cur_val):
                         sev = classify(engine_key, "instance", "parameter", k) or "unknown"
                         dev["deviations"].append({
                             "kind": "parameter", "scope": "instance", "name": k,
@@ -206,7 +282,7 @@ def detect(baseline: dict, session, region: str, check_log_groups: bool):
                 if not cw_log_group_exists(logs, lg):
                     sev = classify(engine_key, "instance", "log-group", lg) or "unknown"
                     dev["deviations"].append({
-                        "kind": "log-group", "scope": "instance", "logGroup": lg,
+                        "kind": "log-group", "scope": "instance", "name": lg, "logGroup": lg,
                         "reason": "enabled export has no log group", "severity": sev
                     })
         if dev["deviations"]:
@@ -247,7 +323,7 @@ def detect(baseline: dict, session, region: str, check_log_groups: bool):
                             "pg": pg, "comparison": "subset", "severity": sev
                         })
                     continue
-                if cur_val is None or str(cur_val) != str(v):
+                if cur_val is None or values_differ(v, cur_val):
                     sev = classify(engine_key, "cluster", "parameter", k) or "unknown"
                     dev["deviations"].append({
                         "kind": "parameter", "scope": "cluster", "name": k,
@@ -268,7 +344,7 @@ def detect(baseline: dict, session, region: str, check_log_groups: bool):
                 if not cw_log_group_exists(logs, lg):
                     sev = classify(engine_key, "cluster", "log-group", lg) or "unknown"
                     dev["deviations"].append({
-                        "kind": "log-group", "scope": "cluster", "logGroup": lg,
+                        "kind": "log-group", "scope": "cluster", "name": lg, "logGroup": lg,
                         "reason": "enabled export has no log group", "severity": sev
                     })
         if dev["deviations"]:
@@ -292,7 +368,10 @@ def detect(baseline: dict, session, region: str, check_log_groups: bool):
         "exportDrifts": total_export_drifts,
         "logGroupDrifts": total_log_group_drifts,
         "hasDrift": bool(report["instances"] or report["clusters"]),
-        "severityTotals": severity_totals
+        "severityTotals": severity_totals,
+        "baselineHash": f"sha256:{baseline_hash}",
+        "toolVersion": TOOL_VERSION,
+        "reportSchemaVersion": REPORT_SCHEMA_VERSION
     }
     return report, summary
 
@@ -354,6 +433,7 @@ def main():
     ap.add_argument("--output", default="detect-report.json")
     ap.add_argument("--summary-output", default="detect-summary.json", help="Path to write a drift summary (counts)")
     ap.add_argument("--check-log-groups", action="store_true", help="Also detect missing CloudWatch log groups for currently enabled exports")
+    ap.add_argument("--fail-on-unknown-severity", action="store_true", help="Exit with a distinct code if any deviation has unknown severity (baseline missing severity mapping)")
     # (Future) verbose flag could control warnings; currently warnings always emitted to stderr.
     args = ap.parse_args()
 
@@ -364,6 +444,8 @@ def main():
     except ValueError as ve:
         print(f"ERROR: Invalid baseline: {ve}", file=sys.stderr)
         sys.exit(1)
+
+    baseline_hash = compute_file_sha256(args.baseline)
 
     # Decide how to obtain a session (mutually exclusive flags simplify logic)
     if args.account_role_arn:
@@ -383,13 +465,16 @@ def main():
         except ClientError as e:
             print(f"ERROR: Unable to validate ambient credentials: {e}", file=sys.stderr)
             sys.exit(1)
-    report, summary = detect(baseline, session, args.region, args.check_log_groups)
+    report, summary = detect(baseline, session, args.region, args.check_log_groups, baseline_hash)
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
     with open(args.summary_output, "w", encoding="utf-8") as sf:
         json.dump(summary, sf, indent=2)
     print(f"Wrote detection report: {args.output}")
     print(f"Summary: {json.dumps(summary)}")
+    if args.fail_on_unknown_severity and summary["severityTotals"].get("unknown", 0) > 0:
+        print("Unknown severities present and --fail-on-unknown-severity specified", file=sys.stderr)
+        sys.exit(3)
     if summary["hasDrift"]:
         sys.exit(2)
 
