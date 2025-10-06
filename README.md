@@ -2,7 +2,7 @@
 
 Overview
 - Goal: Detect and optionally remediate deviations from an RDS logging/parameter baseline across multiple AWS accounts
-- This project replaces the previous test stack (CloudFormation + Lambda + DynamoDB) with:
+- Content:
   - A JSON baseline file managed in Git.
   - Two Python scripts:
     - dam-detection.py: non-destructive detection (reports deviations).
@@ -139,52 +139,64 @@ Demote if the signal is too noisy or cost-intensive (e.g., general log on very h
 
 If a deviation lacks a severity mapping it will appear as `unknown`; consider adding it or explicitly deciding to ignore it.
 
- Scripts
+## Scripts
 
-dam-detection.py
-- Purpose: Non-destructive detection of deviations vs baseline.
-- What it checks:
-  - Instance DB parameter groups vs engines["rds/<engine>"].parameters (if not default.* or if skipDefaultParameterGroups=false).
-  - Instance EnabledCloudwatchLogsExports vs engines["..."].exports (MySQL, SQL Server) and optionally existence of matching CloudWatch log groups (`--check-log-groups`).
-  - Aurora cluster parameter groups vs clusterParameters and cluster EnabledCloudwatchLogsExports (plus log groups if flag set).
-- Key behaviors / safeguards (recent additions):
-  - Mutually exclusive credential flags: specify either `--account-role-arn` or `--use-current-credentials` (omitting both defaults to ambient credentials).
-  - Baseline structure validation: early failure with clear message if baseline is malformed.
-  - Sensitive value masking: any parameter name containing `password|secret|token|key|credential` (case-insensitive) is masked in the report (`***MASKED***`). Comparison still uses real values in-memory.
-  - Improved error transparency: Distinguishes AccessDenied vs other errors when listing tags / log groups (prints warnings instead of silently swallowing).
-  - Light retry logic on throttled RDS / tagging parameter calls (exponential backoff, 3 attempts).
-  - Core logic exposed via a reusable `detect()` function for easier unit testing / reuse.
-- Input arguments:
-  - `--baseline` (required): path to baseline JSON.
-  - `--region` (required): AWS region to scan.
-  - `--account-role-arn` OR `--use-current-credentials`: choose auth strategy.
-  - `--output`: full JSON report path (default `detect-report.json`).
-  - `--summary-output`: summary counts path (default `detect-summary.json`).
-  - `--check-log-groups`: also detect missing CloudWatch log groups for currently enabled exports.
-- Output:
-  - Full JSON report (instances/clusters with deviations) plus deviation severities.
-  - Summary JSON (counts: paramDrifts, exportDrifts, logGroupDrifts, severityTotals, objectsWithDrift, hasDrift).
-  - Exit codes:
-    - 0: Success, no drift.
-    - 1: Baseline invalid / credential or assume-role error.
-    - 2: Drift detected.
-  - Warnings printed to stderr for permission issues (do not change exit code unless critical to detection integrity).
+### dam-detection.py
+Purpose: Non-destructive detection of deviations vs the baseline.
 
-Example (Windows PowerShell)
+What it checks:
+- Instance DB parameter groups vs `engines["rds/<engine>"].parameters` (if not `default.*` or if `skipDefaultParameterGroups=false`).
+- Instance `EnabledCloudwatchLogsExports` vs baseline `exports` (MySQL, SQL Server) and optionally existence of matching CloudWatch log groups (`--check-log-groups`).
+- Aurora cluster parameter groups vs `clusterParameters` and cluster exports (plus log groups if flag set).
+
+Key safeguards / behaviors:
+- Mutually exclusive credential flags: either `--account-role-arn` or `--use-current-credentials` (omitting both uses ambient creds).
+- Baseline structural validation (fast fail with meaningful errors).
+- Sensitive value masking: parameter names containing `password|secret|token|key|credential` are masked (`***MASKED***`) in output only.
+- AccessDenied & NotFound warnings surfaced (rather than silent suppression) for tags/log groups.
+- Light retry (exponential backoff) for throttled parameter/tag lookups.
+- Core logic extracted to `detect()` for unit/integration testing.
+- Type-aware comparison: integers, floats, booleans compared using native semantics; strings fallback to exact compare. Multi-value subset logic applied to `shared_preload_libraries`.
+- Metadata embedded in report: `baselineHash` (sha256), `toolVersion`, `reportSchemaVersion` (currently 1).
+- Optional strict baseline completeness enforcement via `--fail-on-unknown-severity` (exit code 3 when unknown severities exist).
+
+Input arguments:
+- `--baseline` (required) – path to baseline JSON.
+- `--region` (required) – AWS region.
+- `--account-role-arn` OR `--use-current-credentials`.
+- `--output` – full JSON report (default `detect-report.json`).
+- `--summary-output` – summary (default `detect-summary.json`).
+- `--check-log-groups` – verify CloudWatch log groups exist for enabled exports.
+- `--fail-on-unknown-severity` – treat any deviation whose severity cannot be mapped as a failure (exit 3).
+
+Output artifacts:
+- Report: deviations array for instances/clusters, each deviation normalized to always include `name`.
+- Summary: counts + severity totals + metadata (`baselineHash`, `toolVersion`, `reportSchemaVersion`).
+- Exit codes:
+  - 0: No drift.
+  - 1: Baseline invalid / credential / assume-role failure.
+  - 2: Drift detected.
+  - 3: Unknown severity encountered with `--fail-on-unknown-severity`.
+
+Warnings (stderr) do not change exit code unless coupled with the unknown severity flag.
+
+Example (PowerShell, assume role):
 ```powershell
-python .\scripts\dam-detection.py `
+python .\dam-detection.py `
   --baseline .\baselines\rds-baseline.json `
   --region eu-west-1 `
   --account-role-arn arn:aws:iam::<ACCOUNT_ID>:role/RDSComplianceRole `
   --output .\reports\detect-<ACCOUNT_ID>-eu-west-1.json
+```
 
-Example with ambient credentials (e.g., local profile) and log group checks:
+Example (ambient credentials + log group checks + strict severity):
 ```powershell
 python .\dam-detection.py `
   --baseline .\baselines\rds-baseline.json `
   --region eu-west-1 `
   --use-current-credentials `
-  --check-log-groups
+  --check-log-groups `
+  --fail-on-unknown-severity
 ```
 ```
 
@@ -261,7 +273,9 @@ Troubleshooting
 - Access denied when assuming role:
   - Check the OIDC trust policy and that the role ARN matches. Ensure audience and subject conditions align with your org’s GitHub settings.
 - Baseline invalid error:
-  - The validator requires a non-empty `engines` object and at least one of `parameters`, `clusterParameters`, or `exports` per engine. Fix structural issues and re-run.
+  - The validator requires a non-empty `engines` object and at least one of `parameters`, `clusterParameters`, or `exports` per engine. Also warns on duplicate exports, orphan severity references, and non-standard levels (still allowed unless enforced downstream). Fix structural issues and re-run.
+- Exit code 3 (unknown severity failure):
+  - Add missing severity mappings or drop the `--fail-on-unknown-severity` flag if intentional during baseline evolution.
 - “previous configuration is in progress” on remediation:
   - Re-run later; the script includes backoff but may need time after prior changes.
 - Default parameter groups:
