@@ -351,6 +351,7 @@ Tip: If unsure, deploy detection only; remediation enablement will be announced 
 - Safeguards planned: stronger dry-run diff, max-changes guardrail, optional severity gating alignment with detection.
 
 ### Current Caveats
+- Github Actions limits file import capabilities. It is currently not possible to import the detect-report file generated from the detetction workflow. This is the main current bottleneck which prevents to have a relevant remediation workflow. Workaround could to include the remediation in the detection workflow, which is not acceptable currently.
 - No automatic reboot orchestration (pending-reboot states left as-is).
 - No transaction rollback; partial changes may occur if throttled.
 - Log group creation (if ever enabled) is off by default; consider alternative centralized log provisioning.
@@ -397,4 +398,5 @@ aws cloudformation wait stack-delete-complete --stack-name rds-compliance-test -
 ```
 
 Optional: extend the stack with additional engines or remove unneeded ones to minimize cost footprint.
+
 
