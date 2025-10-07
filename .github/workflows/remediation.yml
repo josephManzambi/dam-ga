@@ -1,0 +1,91 @@
+name: RDS Compliance Remediation
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: "AWS region"
+        required: true
+        default: "eu-west-1"
+      account_role_arn:
+        description: "Role ARN to assume in the target account"
+        required: true
+      report_artifact_name:
+        description: "Artifact name containing detection report"
+        required: true
+        default: "detect-reports"
+      report_file:
+        description: "Which report file to use from the artifact"
+        required: false
+        default: ""
+      apply:
+        description: "Apply changes (true) or dry-run (false)"
+        required: true
+        default: "false"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  remediate:
+    runs-on: ubuntu-latest
+    environment:
+      name: remediation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.report_artifact_name }}
+          path: reports
+      - name: Derive report file (auto if not provided)
+        id: derive
+        shell: bash
+        run: |
+          set -e
+          acct=$(echo "${{ inputs.account_role_arn }}" | awk -F: '{print $5}')
+            # If user specified a report file, trust it
+          if [ -n "${{ inputs.report_file }}" ]; then
+            if [ ! -f "reports/${{ inputs.report_file }}" ]; then
+              echo "::error ::Specified report_file '${{ inputs.report_file }}' not found in artifact."; ls -R reports || true; exit 1
+            fi
+            echo "report_file=${{ inputs.report_file }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # Auto-pick detect-<acct>-<region>.json
+          candidate="detect-${acct}-${{ inputs.region }}.json"
+          if [ -f "reports/${candidate}" ]; then
+            echo "report_file=${candidate}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # Fallback: attempt to use manifest if present
+          if [ -f "reports/report-index.json" ]; then
+            match=$(jq -r --arg acct "$acct" --arg region "${{ inputs.region }}" '.[] | select(.account==$acct and .region==$region) | .report' reports/report-index.json | head -n1)
+            if [ -n "$match" ] && [ -f "reports/$match" ]; then
+              echo "report_file=$match" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+          echo "::error ::Unable to auto-determine report file for account $acct region ${{ inputs.region }}. Provide report_file explicitly."; ls -R reports || true; exit 1
+      - name: Dry-run remediation (preview)
+        run: |
+          python ./dam-remediation.py \
+            --baseline baselines/rds-baseline.json \
+            --report "reports/${{ steps.derive.outputs.report_file }}" \
+            --region "${{ inputs.region }}" \
+            --account-role-arn "${{ inputs.account_role_arn }}" \
+            --ensure-log-groups
+      - name: Apply remediation (set apply=true)
+        if: ${{ inputs.apply == 'true' }}
+        run: |
+          python ./dam-remediation.py \
+            --baseline baselines/rds-baseline.json \
+            --report "reports/${{ steps.derive.outputs.report_file }}" \
+            --region "${{ inputs.region }}" \
+            --account-role-arn "${{ inputs.account_role_arn }}" \
+            --apply \
+            --ensure-log-groups
