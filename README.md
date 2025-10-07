@@ -1,8 +1,37 @@
 # RDS Compliance – Detection and Remediation
 
-> ⚠️ **Remediation Status: EXPERIMENTAL – Do NOT deploy remediation automation or the remediation IAM role in production.**
->
-> Only the detection script, detection IAM role template, and any detection workflow you create are considered stable for read‑only use. Remediation code and role template are present for review and sandbox experimentation only and may change without notice.
+> ⚠️ **Remediation Status: EXPERIMENTAL – Do NOT deploy remediation automation or the remediation IAM role in production.** Only detection is production‑ready. Remediation content lives in an appendix for review only.
+
+---
+
+## Quick Start (Detection Only)
+
+1. Deploy detection IAM role (GitHub OIDC trust) using `dam-detection-role.yaml` (set `IncludeOIDCProvider=true` only once per account).
+2. (Optional) Restrict to a branch via `DetectionRestrictToBranch` or leave blank to allow PRs / feature branches to run detection.
+3. Run a local detection scan:
+   ```powershell
+   python .\dam-detection.py `
+     --baseline .\baselines\rds-baseline.json `
+     --region eu-west-1 `
+     --use-current-credentials `
+     --output detect-report.json `
+     --summary-output detect-summary.json
+   ```
+4. Review `detect-summary.json` (severity totals) and `detect-report.json` (per deviation).
+5. Add a scheduled GitHub Actions workflow (cron + manual dispatch) that assumes the detection role via OIDC and uploads reports as artifacts.
+6. Gate on severity using workflow inputs: `fail_on_drift` + `fail_min_severity` (start permissive, tighten later).
+
+Exit codes (detection):
+| Code | Meaning |
+|------|---------|
+| 0 | No drift |
+| 1 | Baseline / credential / assume-role error |
+| 2 | Drift detected (severity logic decides workflow fail) |
+| 3 | Unknown severity encountered with `--fail-on-unknown-severity` |
+
+Baseline file lives at `baselines/rds-baseline.json`. Update severities there; no code change required.
+
+---
 
 Overview
 - Goal: Detect and optionally remediate deviations from an RDS logging/parameter baseline across multiple AWS accounts
@@ -10,7 +39,7 @@ Overview
   - A JSON baseline file managed in Git.
   - Two Python scripts:
     - dam-detection.py: non-destructive detection (reports deviations) – **Stable**.
-    - dam-remediation.py: optional remediation (applies changes) – **Experimental (do not automate in prod)**.
+    - dam-remediation.py: optional remediation (applies changes) – **Experimental** (see [Remediation Appendix](#remediation-experimental-appendix)).
   - GitHub Actions workflows (optional) to run detection on schedule and remediation on demand via OIDC and AssumeRole.
 
 Repository structure
@@ -205,58 +234,47 @@ python .\dam-detection.py `
 ```
 ```
 
-dam-remediation.py (Experimental)
-- Current draft intended for code review / sandbox only.
-- Interface, flags, and behavior may change; no backward compatibility guarantee.
-- Do NOT embed in CI/CD or production GitHub Actions yet.
-- Detailed usage examples intentionally removed to reduce risk of accidental deployment.
+## Using Detection
 
-GitHub Actions
+### GitHub Actions (scheduled + manual)
+Core behavior:
+- Assume detection role via OIDC (`permissions: id-token: write`).
+- Iterate role ARNs (multi-account) and regions; produce per-account report & summary.
+- Aggregate job merges summaries into `aggregate-summary.json` for dashboards/gating.
 
-Detection workflow (scheduled + manual)
-- Uses OIDC to assume per-account roles supplied as input.
-- Produces per-account full reports and summaries; aggregate job combines into `all-detect.json`, `all-summaries.json`, and `aggregate-summary.json` with consolidated severity counts.
-- Drift gating is configurable via dispatch inputs:
-  - `fail_on_drift` (true|false, default true) – whether drift can fail the run.
-  - `fail_min_severity` (low|medium|high, default low) – minimum severity that triggers failure when `fail_on_drift=true`.
-    - Observation mode: fail_on_drift=false
-    - Phased enforcement: fail_on_drift=true + fail_min_severity=high (start) then medium
-    - Full enforcement: fail_on_drift=true + fail_min_severity=low
-  - Scheduled runs can optionally be adjusted later to soft-fail automatically if desired.
-Key points:
-- permissions: id-token: write to enable OIDC.
-- Parse a comma-separated list of role ARNs; iterate per region.
+Dispatch inputs you can define:
+- `fail_on_drift` (default: true)
+- `fail_min_severity` (low|medium|high; default: low)
 
-Remediation workflow (Experimental – DO NOT DEPLOY)
-- Intentionally not documented for production; hold off until GA announcement.
+Patterns:
+- Observation: `fail_on_drift=false`
+- Phased enforcement: start with `fail_min_severity=high`, later medium, then low.
 
-Cross-account and permissions
-- No stacks created in child accounts. You only need an IAM role per account (e.g., RDSComplianceRole) with trust policy allowing your GitHub OIDC provider to assume it, and policy with least-privilege:
-  - Read: rds:Describe*, rds:ListTagsForResource
-  - Write (only if remediation is used): rds:ModifyDBParameterGroup, rds:ModifyDBClusterParameterGroup, rds:ModifyDBInstance, rds:ModifyDBCluster
-- Optional: logs:DescribeLogGroups if you later add log group verification (creation is out of scope here by design).
+Key implementation notes:
+- Use artifact upload for raw JSON outputs (avoid noisy console dumps).
+- Keep detection lightweight so it can run daily (consider cron + manual dispatch).
+- Mask secrets automatically (pattern-based) – no extra config required.
 
-Operational guidance
-- Start with detection only. Review reports and tune the baseline (PRs).
-- On agreement, run remediation in dry-run; then apply with approval.
-- For static parameters (require reboot), plan maintenance windows. The scripts do not reboot resources.
-- Aurora exports must be modified at the cluster level (scripts handle this). Instance-level export changes are skipped for Aurora members.
+### Cross-account & permissions
+- No stacks created in target (child) accounts—only an IAM role with OIDC trust is required per account.
+- Read permissions needed: `rds:Describe*`, `rds:ListTagsForResource`, and optionally `logs:DescribeLogGroups` if using `--check-log-groups`.
+- (Future remediation) write actions listed separately in appendix; not required today.
 
-Troubleshooting
-- Access denied when assuming role:
-  - Check the OIDC trust policy and that the role ARN matches. Ensure audience and subject conditions align with your org’s GitHub settings.
-- Baseline invalid error:
-  - The validator requires a non-empty `engines` object and at least one of `parameters`, `clusterParameters`, or `exports` per engine. Also warns on duplicate exports, orphan severity references, and non-standard levels (still allowed unless enforced downstream). Fix structural issues and re-run.
-- Exit code 3 (unknown severity failure):
-  - Add missing severity mappings or drop the `--fail-on-unknown-severity` flag if intentional during baseline evolution.
-- “previous configuration is in progress” on remediation:
-  - Re-run later; the script includes backoff but may need time after prior changes.
-- Default parameter groups:
-  - If your environments use default.* groups but you still want to enforce values, set rules.skipDefaultParameterGroups = false (note: many defaults are immutable).
-- Missing CloudWatch log group warnings:
-  - If you see many warnings with AccessDenied for log groups, ensure the scanning role has `logs:DescribeLogGroups`.
-- Masked values in report:
-  - Masking is name-based pattern matching. If a non-sensitive parameter is masked unexpectedly, rename baseline key if possible or adjust pattern (requires code edit).
+### Operational guidance (detection)
+- Start in observation: collect reports for a few cycles before gating.
+- Tune severities in the baseline to reduce noise (avoid flapping builds).
+- Use PR reviews for baseline changes—hash is embedded in detection outputs.
+- Track drift trend by persisting summaries (e.g., push to S3 or metrics system).
+
+### Troubleshooting (detection)
+- AccessDenied: verify role trust conditions (aud + sub) match branch policy.
+- Unknown severity exit (3): add missing entries in baseline `severity` map.
+- Throttling: the script includes light backoff; rerun or shard accounts if needed.
+- Masked values: rename parameter or accept masking—no secrets are printed.
+
+---
+
+<!-- (Legacy mixed section content consolidated into 'Using Detection' above) -->
 
 License and contributions
 - (Add a LICENSE file if distributing publicly.)
@@ -264,15 +282,15 @@ License and contributions
  
 ## IAM Roles (GitHub Actions OIDC)
 
-You can now deploy detection and remediation IAM roles separately; **only the detection role should be deployed at this time**. The remediation role template is for review only.
+You can deploy the detection IAM role now; the remediation role template is present only for review (see appendix). **Do not deploy remediation to production.**
 
 Files:
 - [`dam-detection-role.yaml`](./dam-detection-role.yaml) – Detection-only (read) role (optionally also creates the GitHub OIDC provider).
 - [`dam-remediation-role.yaml`](./dam-remediation-role.yaml) – Remediation (write) role – **Experimental: do NOT deploy in production**.
 
 Current recommended pattern:
-1. Deploy detection only; run on a schedule to baseline drift.
-2. Defer any remediation deployment until it reaches GA.
+1. Deploy detection only; schedule recurring scans.
+2. Ignore remediation until GA announcement.
 
 Shared key parameters (both templates):
 - `GitHubOwner` / `GitHubRepo`: OWNER/REPO that will run the workflows.
@@ -300,7 +318,7 @@ aws cloudformation deploy `
     DetectionRestrictToBranch= # blank => all refs
 ```
 
-Remediation deploy example intentionally omitted (experimental).
+Remediation deploy example intentionally omitted (experimental; see appendix if evaluating in a sandbox).
 
 Outputs:
 - Detection stack: `DetectionRoleArn`, `ProviderCreated`, `DetectionBranchRestricted`.
@@ -310,16 +328,49 @@ If you still prefer a single combined template approach, you can synthesize one 
 
 ### Which template should I deploy?
 
-| Scenario | Deploy Detection (`dam-detection-role.yaml`) | Deploy Remediation (`dam-remediation-role.yaml`) | Notes |
-|----------|----------------------------------------------|--------------------------------------------------|-------|
-| Baseline / observability | Yes | No | Stable read-only telemetry. |
-| Severity tuning period | Yes | No | Keep remediation disabled. |
-| Sandbox experimentation | Yes | Optional (sandbox only) | Never in production yet. |
-| Production enforcement desire | Yes | No | Wait for remediation GA. |
-| Multi-account rollout | Yes | No | Single OIDC provider; detection only. |
-| Incident/drift investigation | Yes | No | Detection sufficient. |
+| Scenario | Detection Role | Remediation Role | Notes |
+|----------|----------------|-----------------|-------|
+| Baseline / observability | Deploy | Do not deploy | Starting point. |
+| Severity tuning | Keep | Do not deploy | Stabilize signal first. |
+| Sandbox experimentation | Deploy | Optional (sandbox only) | Appendix guidance only. |
+| Production enforcement | Deploy | Hold | Await GA. |
+| Multi-account rollout | Deploy | Skip | Central OIDC provider reuse. |
+| Incident investigation | Deploy | Skip | Read-only sufficient. |
 
 Tip: If unsure, deploy detection only; remediation enablement will be announced when production-ready.
+
+---
+
+## Remediation (Experimental Appendix)
+
+> This appendix is intentionally high-level. Do **not** operationalize until GA.
+
+### Scope (Draft)
+- Script: `dam-remediation.py` (may change).
+- Actions: modify parameter groups, enable exports (instance & Aurora cluster).
+- Safeguards planned: stronger dry-run diff, max-changes guardrail, optional severity gating alignment with detection.
+
+### Current Caveats
+- No automatic reboot orchestration (pending-reboot states left as-is).
+- No transaction rollback; partial changes may occur if throttled.
+- Log group creation (if ever enabled) is off by default; consider alternative centralized log provisioning.
+
+### Evaluation Guidance (Sandbox Only)
+If you must experiment:
+1. Use a non-production account with disposable RDS instances.
+2. Run detection, capture a report.
+3. Manually inspect intended changes (dry-run logic or code reading).
+4. Discard environment after test.
+
+### Not Implemented Yet (Planned)
+- Change batching safety limits per engine type.
+- Explicit diff artifact prior to apply.
+- Guardrail: abort if drift count > threshold.
+
+### Feedback
+Open an issue with: engine type, sample deviation (redacted identifiers), desired guardrail.
+
+---
 
 ## Test Infrastructure (Optional)
 
