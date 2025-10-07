@@ -1,0 +1,110 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  IAM OIDC provider (optional) + Detection (read-only) role for RDS compliance
+  scripts run via GitHub Actions. This trimmed template intentionally omits any
+  remediation capabilities so you can deploy a detection-only workflow.
+
+Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub organization or user (OWNER in OWNER/REPO)
+  GitHubRepo:
+    Type: String
+    Description: Repository name (REPO in OWNER/REPO)
+  DetectionRestrictToBranch:
+    Type: String
+    Default: ''
+    Description: Optional branch name to restrict detection role (blank keeps detection open to any ref)
+  IncludeOIDCProvider:
+    Type: String
+    AllowedValues: [true, false]
+    Default: false
+    Description: Set true to create GitHub OIDC provider (skip if it already exists)
+  AdditionalIAMPrincipals:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Optional extra IAM principals (users/roles) allowed to assume roles (for local testing)
+  PermissionBoundaryArn:
+    Type: String
+    Default: ''
+    Description: Optional permission boundary ARN
+
+Conditions:
+  CreateProvider: !Equals [!Ref IncludeOIDCProvider, true]
+  UseDetectionBranchRestriction: !Not [!Equals [!Ref DetectionRestrictToBranch, '']]
+  HasBoundary: !Not [!Equals [!Ref PermissionBoundaryArn, '']]
+  HasAdditionalPrincipals: !Not [!Equals [!Join ['', !Ref AdditionalIAMPrincipals], '']]
+
+Resources:
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList: ['6938fd4d98bab03faadb97b34396831e3780aea1']
+
+  DetectionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: dam-detection-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RDSDescribe
+            Effect: Allow
+            Action:
+              - rds:Describe*
+              - rds:ListTagsForResource
+            Resource: '*'
+          - Sid: LogsDescribe
+            Effect: Allow
+            Action: [logs:DescribeLogGroups]
+            Resource: '*'
+          - Sid: CallerIdentity
+            Effect: Allow
+            Action: [sts:GetCallerIdentity]
+            Resource: '*'
+
+
+  DetectionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: dam-detection-role
+      Description: GitHub Actions role for RDS compliance detection
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              # Detection role: optionally restrict to a specific branch if DetectionRestrictToBranch provided
+              StringLike: !If
+                - UseDetectionBranchRestriction
+                - { token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOwner}/${GitHubRepo}:ref:refs/heads/${DetectionRestrictToBranch}' }
+                - { token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOwner}/${GitHubRepo}:*' }
+          - !If
+            - HasAdditionalPrincipals
+            - {
+                "Effect": "Allow",
+                "Principal": {"AWS": !Ref AdditionalIAMPrincipals},
+                "Action": "sts:AssumeRole"
+              }
+            - !Ref 'AWS::NoValue'
+      ManagedPolicyArns: [!Ref DetectionPolicy]
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionBoundaryArn, !Ref 'AWS::NoValue']
+
+Outputs:
+  DetectionRoleArn:
+    Description: ARN of detection role
+    Value: !GetAtt DetectionRole.Arn
+  ProviderCreated:
+    Description: Whether OIDC provider was created by this stack
+    Value: !If [CreateProvider, 'true', 'false']
+  DetectionBranchRestricted:
+    Description: Whether detection role is restricted to a single branch
+    Value: !If [UseDetectionBranchRestriction, 'true', 'false']
