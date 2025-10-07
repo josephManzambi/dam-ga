@@ -1,18 +1,23 @@
 # RDS Compliance – Detection and Remediation
 
+> ⚠️ **Remediation Status: EXPERIMENTAL – Do NOT deploy remediation automation or the remediation IAM role in production.**
+>
+> Only the detection script, detection IAM role template, and any detection workflow you create are considered stable for read‑only use. Remediation code and role template are present for review and sandbox experimentation only and may change without notice.
+
 Overview
 - Goal: Detect and optionally remediate deviations from an RDS logging/parameter baseline across multiple AWS accounts
 - Content:
   - A JSON baseline file managed in Git.
   - Two Python scripts:
-    - dam-detection.py: non-destructive detection (reports deviations).
-    - dam-remediation.py: optional remediation (applies changes).
+    - dam-detection.py: non-destructive detection (reports deviations) – **Stable**.
+    - dam-remediation.py: optional remediation (applies changes) – **Experimental (do not automate in prod)**.
   - GitHub Actions workflows (optional) to run detection on schedule and remediation on demand via OIDC and AssumeRole.
 
 Repository structure
 - baselines/rds-baseline.json – baseline parameters & exports with severity.
 - dam-detection.py / dam-remediation.py – detection & remediation scripts.
-- iam-rds-compliance-roles.yaml – OIDC detection & remediation roles.
+- dam-detection-role.yaml – CloudFormation: detection-only IAM role (optional OIDC provider).
+- dam-remediation-role.yaml – CloudFormation: remediation IAM role (optional OIDC provider & log group mgmt actions).
 - .github/workflows/detection.yml / remediation.yml – automation.
 - test-rds-dam-stack.yaml – optional test stack (scripts only).
 - README.md – this document.
@@ -200,41 +205,11 @@ python .\dam-detection.py `
 ```
 ```
 
-dam-remediation.py
-- Purpose: Optional application of changes to match the baseline (read-only unless --apply).
-- What it does:
-  - For instance deviations: ModifyDBParameterGroup (batched), ModifyDBInstance to enable missing exports (with retries if config in progress).
-  - For cluster deviations (Aurora PG): ModifyDBClusterParameterGroup, ModifyDBCluster to enable missing cluster exports (with retries).
-  - Honors a minimum severity threshold (`--min-severity`) so you can phase remediation (e.g., remediate only high first).
-- Does NOT:
-  - Create or delete infrastructure (no log group creation, no option groups).
-  - Reboot instances/clusters automatically (RDS may set pending-reboot for static parameter changes).
-- Input arguments:
-  - --baseline: path to baseline JSON.
-  - --report: path to a detection report (output of dam-detection.py).
-  - --region, --account-role-arn: same as detection.
-  - --apply: actually apply changes. Without this flag, it’s a dry-run.
-  - --min-severity: low|medium|high (default low – apply all). Set to high for incremental rollout.
-- Output:
-  - Console logs indicating intended/applied changes.
-
-Example (Windows PowerShell)
-```powershell
-# Dry-run (preview)
-python .\scripts\dam-remediation.py `
-  --baseline .\baselines\rds-baseline.json `
-  --report .\reports\detect-<ACCOUNT_ID>-eu-west-1.json `
-  --region eu-west-1 `
-  --account-role-arn arn:aws:iam::<ACCOUNT_ID>:role/RDSComplianceRole
-
-# Apply
-python .\scripts\dam-remediation.py `
-  --baseline .\baselines\rds-baseline.json `
-  --report .\reports\detect-<ACCOUNT_ID>-eu-west-1.json `
-  --region eu-west-1 `
-  --account-role-arn arn:aws:iam::<ACCOUNT_ID>:role/RDSComplianceRole `
-  --apply
-```
+dam-remediation.py (Experimental)
+- Current draft intended for code review / sandbox only.
+- Interface, flags, and behavior may change; no backward compatibility guarantee.
+- Do NOT embed in CI/CD or production GitHub Actions yet.
+- Detailed usage examples intentionally removed to reduce risk of accidental deployment.
 
 GitHub Actions
 
@@ -252,10 +227,8 @@ Key points:
 - permissions: id-token: write to enable OIDC.
 - Parse a comma-separated list of role ARNs; iterate per region.
 
-Remediation workflow (manual, gated)
-- Manual-only with environment protection/approval.
-- Downloads a report artifact and runs dam-remediation.py.
-- Add an explicit apply toggle or separate step requiring approval.
+Remediation workflow (Experimental – DO NOT DEPLOY)
+- Intentionally not documented for production; hold off until GA announcement.
 
 Cross-account and permissions
 - No stacks created in child accounts. You only need an IAM role per account (e.g., RDSComplianceRole) with trust policy allowing your GitHub OIDC provider to assume it, and policy with least-privilege:
@@ -291,33 +264,62 @@ License and contributions
  
 ## IAM Roles (GitHub Actions OIDC)
 
-Use the `iam-rds-compliance-roles.yaml` template to deploy detection and remediation roles.
+You can now deploy detection and remediation IAM roles separately; **only the detection role should be deployed at this time**. The remediation role template is for review only.
 
-Key parameters:
-- GitHubOwner / GitHubRepo: OWNER/REPO that will run the workflows.
-- IncludeOIDCProvider=true when you have NOT yet created the GitHub OIDC provider in the account (otherwise leave false).
-- RestrictToBranch: Branch enforced for the remediation role (default: main). Leave blank to allow all refs.
-- DetectionRestrictToBranch: (Optional) If you also want to lock detection to a branch; leave blank to allow experimentation from any ref.
-- EnableLogGroupCreation=true to let remediation create and tag missing /aws/rds/* log groups (aligns with --ensure-log-groups option of remediation script).
-- AdditionalIAMPrincipals: Comma-separated extra AWS principals (roles/users) that may assume the roles for local testing.
-- PermissionBoundaryArn: Apply an org permission boundary if required.
+Files:
+- [`dam-detection-role.yaml`](./dam-detection-role.yaml) – Detection-only (read) role (optionally also creates the GitHub OIDC provider).
+- [`dam-remediation-role.yaml`](./dam-remediation-role.yaml) – Remediation (write) role – **Experimental: do NOT deploy in production**.
 
-Example deploy (PowerShell) using AWS CLI (adjust parameters):
+Current recommended pattern:
+1. Deploy detection only; run on a schedule to baseline drift.
+2. Defer any remediation deployment until it reaches GA.
+
+Shared key parameters (both templates):
+- `GitHubOwner` / `GitHubRepo`: OWNER/REPO that will run the workflows.
+- `IncludeOIDCProvider`: true if the GitHub OIDC provider does NOT yet exist in the account. Only one stack should create it.
+- `AdditionalIAMPrincipals`: Extra principals (comma separated) permitted to assume for local or break‑glass testing.
+- `PermissionBoundaryArn`: Attach an organizational permission boundary if required.
+
+Detection template specific:
+- `DetectionRestrictToBranch`: Optional; lock detection to a single branch (leave blank to allow any ref such as feature branches / PRs).
+
+Remediation template specific (Experimental – subject to change):
+- `RestrictToBranch`: Branch restriction (avoid use until GA).
+- `EnableLogGroupCreation`: Potential capability; avoid enabling now.
+
+Example deploy (detection-only) – PowerShell:
 ```powershell
 aws cloudformation deploy `
-  --stack-name rds-compliance-roles `
-  --template-file iam-rds-compliance-roles.yaml `
+  --stack-name rds-compliance-detection `
+  --template-file dam-detection-role.yaml `
   --capabilities CAPABILITY_IAM `
   --parameter-overrides `
     GitHubOwner=your-org `
     GitHubRepo=your-repo `
-    IncludeOIDCProvider=false `
-    RestrictToBranch=main `
-    DetectionRestrictToBranch= `
-    EnableLogGroupCreation=true
+    IncludeOIDCProvider=true ` # Set true only once per account
+    DetectionRestrictToBranch= # blank => all refs
 ```
 
-After deployment, reference the exported role ARNs (or describe the stack) in your GitHub Actions workflows for detection and remediation.
+Remediation deploy example intentionally omitted (experimental).
+
+Outputs:
+- Detection stack: `DetectionRoleArn`, `ProviderCreated`, `DetectionBranchRestricted`.
+- Remediation stack (if deployed only in an isolated sandbox for evaluation): `RemediationRoleArn`, `ProviderCreated`, `BranchRestricted`, `LogGroupManagementEnabled`.
+
+If you still prefer a single combined template approach, you can synthesize one from these two files (earlier commit history in the repo also contains a combined version).
+
+### Which template should I deploy?
+
+| Scenario | Deploy Detection (`dam-detection-role.yaml`) | Deploy Remediation (`dam-remediation-role.yaml`) | Notes |
+|----------|----------------------------------------------|--------------------------------------------------|-------|
+| Baseline / observability | Yes | No | Stable read-only telemetry. |
+| Severity tuning period | Yes | No | Keep remediation disabled. |
+| Sandbox experimentation | Yes | Optional (sandbox only) | Never in production yet. |
+| Production enforcement desire | Yes | No | Wait for remediation GA. |
+| Multi-account rollout | Yes | No | Single OIDC provider; detection only. |
+| Incident/drift investigation | Yes | No | Detection sufficient. |
+
+Tip: If unsure, deploy detection only; remediation enablement will be announced when production-ready.
 
 ## Test Infrastructure (Optional)
 
