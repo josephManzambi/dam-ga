@@ -62,12 +62,25 @@ jobs:
             echo "report_file=${candidate}" >> $GITHUB_OUTPUT
             exit 0
           fi
+          # Also check inside combined/ (aggregation layout)
+          if [ -f "reports/combined/${candidate}" ]; then
+            echo "report_file=combined/${candidate}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           # Fallback: attempt to use manifest if present
-          if [ -f "reports/report-index.json" ]; then
-            match=$(jq -r --arg acct "$acct" --arg region "${{ inputs.region }}" '.[] | select(.account==$acct and .region==$region) | .report' reports/report-index.json | head -n1)
-            if [ -n "$match" ] && [ -f "reports/$match" ]; then
-              echo "report_file=$match" >> $GITHUB_OUTPUT
-              exit 0
+          manifest="reports/report-index.json"
+          [ -f "$manifest" ] || manifest="reports/combined/report-index.json"
+          if [ -f "$manifest" ]; then
+            match=$(jq -r --arg acct "$acct" --arg region "${{ inputs.region }}" '.[] | select(.account==$acct and .region==$region) | .report' "$manifest" | head -n1)
+            if [ -n "$match" ]; then
+              # Prefer path resolution: check root then combined
+              if [ -f "reports/$match" ]; then
+                echo "report_file=$match" >> $GITHUB_OUTPUT
+                exit 0
+              elif [ -f "reports/combined/$match" ]; then
+                echo "report_file=combined/$match" >> $GITHUB_OUTPUT
+                exit 0
+              fi
             fi
           fi
           echo "::error ::Unable to auto-determine report file for account $acct region ${{ inputs.region }}. Provide report_file explicitly."; ls -R reports || true; exit 1
